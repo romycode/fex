@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 # GPUI de Zed main (renderer wgpu en Linux). Fijado a un commit concreto: la API cambia a menudo.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false, features = ["wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false, features = ["wayland"] }
 futures = "0.3"
 notify = "8"
 # Papelera freedesktop (~/.local/share/Trash y .Trash-$UID por punto de montaje)

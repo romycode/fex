@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Proyecto de prueba desarrollado al 100 % por IA.** Todo el código, los iconos, los tests y esta documentación los ha escrito un asistente de IA (Claude, de Anthropic) a partir de las indicaciones de una persona. Es un experimento: no está auditado ni probado en uso real. Revísalo antes de usarlo con ficheros que te importen.
 
-Objetivo: **< 200 ms desde exec hasta el primer frame** en Linux (Wayland/X11).
+Objetivo: **< 200 ms desde exec hasta el primer frame** en Linux. **Solo Wayland**: el backend X11 de GPUI no se compila (13 crates menos, sin `libxcb`). En una sesión X11 no arranca.
 
 GPUI viene de Zed `main`, fijado al commit `d2a4fb6` (renderer wgpu en Linux).
 
@@ -66,8 +66,8 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6` (renderer wgpu en Linux).
 - Debian/Ubuntu:
 
   ```sh
-  sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
-    libxcb1-dev libx11-xcb-dev libfontconfig-dev libzstd-dev pkg-config clang cmake
+  sudo apt install libxkbcommon-dev libwayland-dev libvulkan-dev \
+    libfontconfig-dev libzstd-dev pkg-config clang cmake
   ```
 
 - Un driver Vulkan funcional (`vulkaninfo --summary`).
