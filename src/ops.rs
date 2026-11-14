@@ -284,7 +284,7 @@ mod tests {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
             let p = std::env::temp_dir().join(format!(
-                "fexp-test-{}-{}",
+                "fex-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
@@ -389,6 +389,6 @@ mod tests {
         assert_eq!(parse_clipboard(&gnome).unwrap().1, Op::Move);
         assert_eq!(parse_clipboard(&a.display().to_string()).unwrap().1, Op::Copy);
         assert!(parse_clipboard("hola mundo").is_none());
-        assert!(parse_clipboard("/no/existe/fexp").is_none());
+        assert!(parse_clipboard("/no/existe/fex").is_none());
     }
 }

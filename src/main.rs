@@ -1,4 +1,4 @@
-//! fexp — POC de explorador de archivos con GPUI.
+//! fex — POC de explorador de archivos con GPUI.
 //!
 //! Reglas para llegar al primer frame rápido:
 //! - La ventana se abre y pinta ANTES de leer el directorio.
@@ -1425,7 +1425,7 @@ fn start_dir(arg: Option<String>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `fexp --bench DIR`: mide listado + stat sin GUI.
+/// `fex --bench DIR`: mide listado + stat sin GUI.
 fn bench(dir: PathBuf) {
     for show_hidden in [false, true] {
         let t = Instant::now();
@@ -1446,7 +1446,7 @@ fn bench(dir: PathBuf) {
 fn main() {
     T0.set(Instant::now()).ok();
 
-    let mut exit_after_first_frame = std::env::var_os("FEXP_EXIT_AFTER_FIRST_FRAME").is_some();
+    let mut exit_after_first_frame = std::env::var_os("FEX_EXIT_AFTER_FIRST_FRAME").is_some();
     let mut forced_mode = None;
     let mut forced_lang = None;
     let mut dir_arg = None;
@@ -1470,16 +1470,16 @@ fn main() {
     }
 
     application().with_assets(Assets).run(move |cx: &mut App| {
-        eprintln!("[fexp] app lista: {:.1} ms", since_start_ms());
+        eprintln!("[fex] app lista: {:.1} ms", since_start_ms());
         let bounds = Bounds::centered(None, size(px(1000.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some("fexp".into()),
+                app_id: Some("fex".into()),
                 ..Default::default()
             },
             move |window, cx| {
-                eprintln!("[fexp] ventana creada: {:.1} ms", since_start_ms());
+                eprintln!("[fex] ventana creada: {:.1} ms", since_start_ms());
                 let view = cx.new(|cx| {
                     let mut e = Explorer::new(dir, window, cx);
                     if let Some(m) = forced_mode {
@@ -1493,7 +1493,7 @@ fn main() {
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
                 window.on_next_frame(move |_window, cx| {
-                    eprintln!("[fexp] primer frame: {:.1} ms", since_start_ms());
+                    eprintln!("[fex] primer frame: {:.1} ms", since_start_ms());
                     if exit_after_first_frame {
                         cx.quit();
                     }

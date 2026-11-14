@@ -1,4 +1,7 @@
-# fexp — POC explorador de archivos (Rust + GPUI)
+# fex — POC explorador de archivos (Rust + GPUI)
+
+> [!WARNING]
+> **Proyecto de prueba desarrollado al 100 % por IA.** Todo el código, los iconos, los tests y esta documentación los ha escrito un asistente de IA (Claude, de Anthropic) a partir de las indicaciones de una persona. Es un experimento: no está auditado ni probado en uso real. Revísalo antes de usarlo con ficheros que te importen.
 
 Objetivo: **< 200 ms desde exec hasta el primer frame** en Linux (Wayland/X11).
 
@@ -23,7 +26,7 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6` (renderer wgpu en Linux).
   - borrado permanente con confirmación. No sigue symlinks.
   - renombrado en línea: selecciona el nombre sin extensión, como Nautilus.
   - nueva carpeta, que entra directamente en modo renombrar.
-- **Portapapeles del sistema**: al copiar deja las rutas como texto. Al pegar entiende rutas, `file://` URIs y el formato de Nautilus/GNOME (`copy`/`cut`), así que se puede copiar desde Nautilus y pegar en fexp.
+- **Portapapeles del sistema**: al copiar deja las rutas como texto. Al pegar entiende rutas, `file://` URIs y el formato de Nautilus/GNOME (`copy`/`cut`), así que se puede copiar desde Nautilus y pegar en fex.
 - **Deshacer (Ctrl+Z)**, con una pila de 50 pasos:
   - papelera → restaura desde la papelera.
   - mover/cortar → lo devuelve a su sitio.
@@ -81,16 +84,16 @@ El primer build tarda: descarga el repo de Zed y compila wgpu. Cuenta con 5–15
 
 ```sh
 # Tiempos internos (desde main): app lista, ventana creada, primer frame
-./target/release/fexp ~
+./target/release/fex ~
 
 # Arranque real en frío, incluyendo exec + carga de .so + teardown
-hyperfine --warmup 3 './target/release/fexp --exit-after-first-frame ~'
+hyperfine --warmup 3 './target/release/fex --exit-after-first-frame ~'
 
 # Solo I/O, sin GUI (para comparar tamaños de directorio y FS)
-./target/release/fexp --bench /usr/lib
+./target/release/fex --bench /usr/lib
 ```
 
-`--exit-after-first-frame` (o `FEXP_EXIT_AFTER_FIRST_FRAME=1`) cierra la app tras el primer frame, así que hyperfine mide el arranque completo.
+`--exit-after-first-frame` (o `FEX_EXIT_AFTER_FIRST_FRAME=1`) cierra la app tras el primer frame, así que hyperfine mide el arranque completo.
 
 Lo que debes mirar:
 
@@ -125,3 +128,7 @@ No incluye todavía:
 - DnD
 - pestañas
 - búsqueda
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).

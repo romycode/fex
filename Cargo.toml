@@ -1,5 +1,5 @@
 [package]
-name = "fexp"
+name = "fex"
 version = "0.1.0"
 edition = "2024"
 description = "POC: explorador de archivos para Linux con GPUI; objetivo < 200 ms al primer frame"

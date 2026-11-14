@@ -144,7 +144,7 @@ mod tests {
     use crate::ops::{Op, paste, rename};
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("fexp-undo-{tag}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("fex-undo-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
