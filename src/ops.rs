@@ -582,9 +582,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_preserves_non_utf8_names() {
+    fn copy_preserves_original_names() {
         let t = Tmp::new();
+        #[cfg(target_os = "linux")]
         let name = OsString::from_vec(b"file-\xff".to_vec());
+        #[cfg(target_os = "macos")]
+        let name = OsString::from("file-文件");
         let source = t.0.join("source").join(&name);
         fs::create_dir(t.0.join("source")).unwrap();
         fs::create_dir(t.0.join("target")).unwrap();

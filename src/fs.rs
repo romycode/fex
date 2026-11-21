@@ -165,18 +165,22 @@ pub fn places() -> Vec<Place> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn listing_keeps_distinct_raw_names() {
+    fn listing_keeps_distinct_names() {
         let directory = tempfile::tempdir().unwrap();
-        let raw = OsString::from_vec(b"name-\xff".to_vec());
-        let display = OsString::from(raw.to_string_lossy().into_owned());
-        fs::write(directory.path().join(&raw), "one").unwrap();
+        #[cfg(target_os = "linux")]
+        let original = OsString::from_vec(b"name-\xff".to_vec());
+        #[cfg(target_os = "macos")]
+        let original = OsString::from("name-文件");
+        let display = OsString::from("name-�");
+        fs::write(directory.path().join(&original), "one").unwrap();
         fs::write(directory.path().join(&display), "two").unwrap();
         let entries = list_dir(directory.path(), false).unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.name == raw));
+        assert!(entries.iter().any(|entry| entry.name == original));
         assert!(entries.iter().any(|entry| entry.name == display));
     }
 
