@@ -102,6 +102,8 @@ cargo build --release --locked --target aarch64-apple-darwin
 
 ## Instalar la beta
 
+Desde el repositorio, ejecuta `make install` para compilar en modo release e instalar el binario en `~/.local/bin/fex`. Puedes cambiar el destino con `make install BINDIR=/ruta/al/bin`.
+
 El workflow de cada plataforma genera un paquete descargable como artefacto de la ejecución. También puedes generarlo con:
 
 ```sh
