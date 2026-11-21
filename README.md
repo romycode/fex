@@ -102,7 +102,7 @@ cargo build --release --locked --target aarch64-apple-darwin
 
 ## Instalar la beta
 
-Desde el repositorio, ejecuta `make install` para compilar en modo release e instalar el binario en `~/.local/bin/fex`. Puedes cambiar el destino con `make install BINDIR=/ruta/al/bin`.
+Desde el repositorio, ejecuta `make install` para compilar e instalar Fex en `~/.local/bin/fex`. El instalador detecta Linux o macOS con Apple Silicon y compila en modo release para la CPU de la máquina (`target-cpu=native`, ThinLTO y una unidad de generación de código). En macOS necesitas un toolchain de Rust arm64. El binario puede requerir instrucciones que no estén disponibles en otros procesadores. Puedes cambiar el destino con `make install BINDIR=/ruta/al/bin`.
 
 El workflow de cada plataforma genera un paquete descargable como artefacto de la ejecución. También puedes generarlo con:
 
