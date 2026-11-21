@@ -47,6 +47,8 @@ icons! {
     Music => "music",
     Videos => "videos",
     System => "system",
+    Pin => "pin",
+    Close => "close",
     ArrowUp => "arrow-up",
     ChevronRight => "chevron-right",
     Eye => "eye",

@@ -1,4 +1,4 @@
-//! Vigila el directorio actual con inotify (vía `notify`) y avisa por un canal.
+//! Vigila el directorio actual con el backend nativo de `notify` y avisa por un canal.
 //! Se crea perezosamente tras el primer listado: no cuesta nada en el arranque.
 
 use std::path::{Path, PathBuf};

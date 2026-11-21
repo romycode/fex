@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fex
+Comment=Browse files and folders
+Comment[es]=Explora archivos y carpetas
+Comment[ca]=Explora fitxers i carpetes
+Exec=fex %f
+Icon=fex
+Terminal=false
+Categories=System;FileManager;
+MimeType=inode/directory;
+StartupNotify=true

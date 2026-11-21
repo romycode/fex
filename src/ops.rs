@@ -4,11 +4,23 @@
 //! ("x (copia).txt", "x (2).txt").
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs, io,
-    os::unix::ffi::OsStringExt,
+    os::unix::{ffi::OsStringExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct Trashed {
+    pub original: PathBuf,
+    pub location: PathBuf,
+    pub info: PathBuf,
+    pub snapshot: crate::safe_fs::Snapshot,
+}
+#[cfg(target_os = "macos")]
+pub use crate::macos::Trashed;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -28,14 +40,23 @@ pub enum OpError {
     Trash(String, String),
 }
 
+#[derive(Clone, Debug)]
+pub struct Retry {
+    pub sources: Vec<PathBuf>,
+    pub destination: PathBuf,
+    pub operation: Op,
+}
+
 #[derive(Default, Debug)]
 pub struct Report {
+    pub created_paths: Vec<PathBuf>,
+    pub retry: Option<Retry>,
     /// Nombres resultantes dentro del directorio destino (para seleccionarlos al terminar).
-    pub created: Vec<String>,
+    pub created: Vec<OsString>,
     /// (origen, destino) de cada elemento pegado: lo necesita el deshacer.
     pub pairs: Vec<(PathBuf, PathBuf)>,
     /// Rutas enviadas a la papelera con éxito.
-    pub trashed: Vec<PathBuf>,
+    pub trashed: Vec<Trashed>,
     pub done: usize,
     pub errors: Vec<OpError>,
 }
@@ -96,24 +117,101 @@ pub fn validate_name(name: &str) -> bool {
 
 // ------------------------------------------------------------- copiar ----
 
-/// Copia recursiva. Los symlinks se copian como symlinks (sin seguirlos: evita bucles).
+/// Copia a un directorio temporal del destino y publica el resultado completo.
+#[cfg(test)]
 pub fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    copy_with_progress(src, dst, None)
+}
+
+fn copy_with_progress(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
+    let parent = dst.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let source = crate::safe_fs::Snapshot::capture(src)?;
+    let pending = tempfile::Builder::new().prefix(".fex-copy-").tempdir_in(parent)?;
+    let staged = pending.path().join("content");
+    copy_tree(src, &staged, progress)?;
+    source.verify()?;
+    crate::safe_fs::rename_exclusive(&staged, dst)
+}
+
+fn copy_tree(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
-    let ft = meta.file_type();
-    if ft.is_symlink() {
+    if meta.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)
-    } else if ft.is_dir() {
+    } else if meta.is_dir() {
         fs::create_dir(dst)?;
         for entry in fs::read_dir(src)? {
             let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()), progress)?;
         }
-        // Permisos al final: un directorio 0555 no dejaría escribir los hijos.
-        fs::set_permissions(dst, meta.permissions())
-    } else if ft.is_file() {
-        fs::copy(src, dst).map(|_| ())
+        let source = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(src)?;
+        let destination = fs::File::open(dst)?;
+        copy_metadata(&source, &destination, &meta)
+    } else if meta.is_file() {
+        let mut input = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(src)?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+        let mut buffer = vec![0; 256 * 1024];
+        loop {
+            use io::{Read, Write};
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            if let Some(progress) = progress {
+                progress.fetch_add(count as u64, Ordering::Relaxed);
+            }
+        }
+        copy_metadata(&input, &output, &meta)?;
+        output.sync_all()
     } else {
         Err(io::Error::new(io::ErrorKind::Unsupported, "tipo de fichero especial"))
+    }
+}
+
+fn copy_metadata(source: &fs::File, destination: &fs::File, metadata: &fs::Metadata) -> io::Result<()> {
+    use xattr::FileExt;
+    for name in source.list_xattr()? {
+        if let Some(value) = source.get_xattr(&name)? {
+            destination.set_xattr(&name, &value)?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // Los descriptores se mantienen abiertos. Foundation conserva ACL con copyfile.
+        let result = unsafe {
+            libc::fcopyfile(source.as_raw_fd(), destination.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_ACL)
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    destination.set_permissions(metadata.permissions())?;
+    destination.set_times(fs::FileTimes::new().set_modified(metadata.modified()?))
+}
+
+/// Mueve sin reemplazar un destino. La copia entre discos se completa antes de borrar.
+pub fn move_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
+    move_with_progress(src, dst, None)
+}
+
+fn move_with_progress(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
+    match crate::safe_fs::rename_exclusive(src, dst) {
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            let source = crate::safe_fs::Snapshot::capture(src)?;
+            copy_with_progress(src, dst, progress)?;
+            source.verify().map_err(|error| {
+                io::Error::other(format!("{}; copia completa en {}; origen conservado", error, dst.display()))
+            })?;
+            source.remove_verified().map_err(|error| {
+                io::Error::other(format!(
+                    "{}; copia completa en {}; eliminación del origen incompleta",
+                    error,
+                    dst.display()
+                ))
+            })
+        }
+        result => result,
     }
 }
 
@@ -122,47 +220,65 @@ pub fn remove_any(p: &Path) -> io::Result<()> {
     if meta.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) }
 }
 
-pub const EXDEV: i32 = 18;
-
 /// Copia o mueve `srcs` dentro de `dest`.
+#[cfg(test)]
 pub fn paste(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str) -> Report {
+    paste_progress(srcs, dest, op, copy_label, None)
+}
+
+pub fn paste_progress(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str, progress: Option<&AtomicU64>) -> Report {
     let mut r = Report::default();
+    let mut retry_sources = Vec::new();
     for src in srcs {
         let name = file_name(src);
         let is_dir = fs::symlink_metadata(src).map(|m| m.is_dir()).unwrap_or(false);
 
-        if is_dir && dest.starts_with(src) && !(op == Op::Move && src.parent() == Some(dest)) {
+        let canonical_source = fs::canonicalize(src).unwrap_or_else(|_| src.clone());
+        let canonical_dest = fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+        if is_dir && canonical_dest.starts_with(&canonical_source) && !(op == Op::Move && src.parent() == Some(dest)) {
             r.errors.push(OpError::IntoItself(name));
             continue;
         }
         let same_dir = src.parent() == Some(dest);
         if op == Op::Move && same_dir {
-            r.created.push(name); // mover al mismo sitio: no-op
+            r.created.push(src.file_name().unwrap_or_default().to_os_string()); // mover al mismo sitio: no-op
             r.done += 1;
             continue;
         }
-        let target_name = unique_name(dest, &name, is_dir, (op == Op::Copy && same_dir).then_some(copy_label));
-        let target = dest.join(&target_name);
-
-        let result = match op {
-            Op::Copy => copy_recursive(src, &target),
-            Op::Move => match fs::rename(src, &target) {
-                Err(e) if e.raw_os_error() == Some(EXDEV) => {
-                    // Otro sistema de ficheros: copiar y borrar el original.
-                    copy_recursive(src, &target).and_then(|_| remove_any(src))
-                }
-                other => other,
-            },
-            Op::Trash | Op::Delete => unreachable!(),
+        // El nombre original se conserva incluso cuando no es UTF-8.
+        let mut target = dest.join(src.file_name().unwrap_or_default());
+        if op == Op::Copy && same_dir {
+            target = dest.join(unique_name(dest, &name, is_dir, Some(copy_label)));
+        }
+        let result = loop {
+            let result = match op {
+                Op::Copy => copy_with_progress(src, &target, progress),
+                Op::Move => move_with_progress(src, &target, progress),
+                Op::Trash | Op::Delete => unreachable!(),
+            };
+            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists) {
+                target = dest.join(unique_name(dest, &name, is_dir, None));
+                continue;
+            }
+            break result;
         };
         match result {
             Ok(()) => {
-                r.created.push(target_name);
+                r.created.push(target.file_name().unwrap_or_default().to_os_string());
+                r.created_paths.push(target.clone());
                 r.pairs.push((src.clone(), target));
                 r.done += 1;
             }
-            Err(e) => r.errors.push(OpError::Io(name, e)),
+            Err(e) => {
+                if !exists(&target) && exists(src) {
+                    retry_sources.push(src.clone());
+                }
+                r.errors.push(OpError::Io(name, e));
+            }
         }
+    }
+    if !retry_sources.is_empty() {
+        r.retry = Some(Retry { sources: retry_sources, destination: dest.to_path_buf(), operation: op });
     }
     r
 }
@@ -170,15 +286,39 @@ pub fn paste(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str) -> Report 
 pub fn trash(paths: &[PathBuf]) -> Report {
     let mut r = Report::default();
     for p in paths {
-        match trash::delete(p) {
-            Ok(()) => {
-                r.trashed.push(p.clone());
+        #[cfg(target_os = "linux")]
+        let moved = trash_linux(p);
+        #[cfg(target_os = "macos")]
+        let moved = crate::macos::move_to_trash(p);
+        match moved {
+            Ok(item) => {
+                r.trashed.extend(item);
                 r.done += 1;
             }
-            Err(e) => r.errors.push(OpError::Trash(file_name(p), e.to_string())),
+            Err(error) => r.errors.push(OpError::Trash(file_name(p), error)),
         }
     }
     r
+}
+
+#[cfg(target_os = "linux")]
+fn trash_linux(path: &Path) -> Result<Option<Trashed>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let original = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    trash::delete(path).map_err(|error| error.to_string())?;
+    let items = trash::os_limited::list().map_err(|error| error.to_string())?;
+    for item in items.into_iter().filter(|item| item.original_path() == path) {
+        let info = PathBuf::from(&item.id);
+        let Some(root) = info.parent().and_then(Path::parent) else { continue };
+        let Some(name) = info.file_stem() else { continue };
+        let location = root.join("files").join(name);
+        let Ok(metadata) = fs::symlink_metadata(&location) else { continue };
+        if metadata.dev() == original.dev() && metadata.ino() == original.ino() {
+            let snapshot = crate::safe_fs::Snapshot::capture(&location).map_err(|error| error.to_string())?;
+            return Ok(Some(Trashed { original: path.to_path_buf(), location, info, snapshot }));
+        }
+    }
+    Ok(None)
 }
 
 pub fn delete(paths: &[PathBuf]) -> Report {
@@ -199,22 +339,28 @@ pub enum NameError {
     Io(io::Error),
 }
 
-pub fn rename(dir: &Path, from: &str, to: &str) -> Result<(), NameError> {
+pub fn rename(dir: &Path, from: &OsStr, to: &str) -> Result<(), NameError> {
     if !validate_name(to) {
         return Err(NameError::Invalid);
     }
-    if from == to {
+    if from == OsStr::new(to) {
         return Ok(());
     }
     if exists(&dir.join(to)) {
         return Err(NameError::Exists(to.to_owned()));
     }
-    fs::rename(dir.join(from), dir.join(to)).map_err(NameError::Io)
+    crate::safe_fs::rename_exclusive(&dir.join(from), &dir.join(to)).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            NameError::Exists(to.to_owned())
+        } else {
+            NameError::Io(error)
+        }
+    })
 }
 
-pub fn mkdir(dir: &Path, base: &str) -> Result<String, NameError> {
+pub fn mkdir(dir: &Path, base: &str) -> Result<OsString, NameError> {
     let name = unique_name(dir, base, true, None);
-    fs::create_dir(dir.join(&name)).map(|_| name).map_err(NameError::Io)
+    fs::create_dir(dir.join(&name)).map(|_| name.into()).map_err(NameError::Io)
 }
 
 // ------------------------------------------------------------ portapapeles ---
@@ -361,9 +507,9 @@ mod tests {
         let t = Tmp::new();
         t.file("a", "");
         t.file("b", "");
-        assert!(matches!(rename(&t.0, "a", "b"), Err(NameError::Exists(_))));
-        assert!(matches!(rename(&t.0, "a", "x/y"), Err(NameError::Invalid)));
-        rename(&t.0, "a", "c").unwrap();
+        assert!(matches!(rename(&t.0, OsStr::new("a"), "b"), Err(NameError::Exists(_))));
+        assert!(matches!(rename(&t.0, OsStr::new("a"), "x/y"), Err(NameError::Invalid)));
+        rename(&t.0, OsStr::new("a"), "c").unwrap();
         assert!(t.0.join("c").exists());
         assert_eq!(mkdir(&t.0, "Nueva carpeta").unwrap(), "Nueva carpeta");
         assert_eq!(mkdir(&t.0, "Nueva carpeta").unwrap(), "Nueva carpeta (2)");
@@ -377,6 +523,126 @@ mod tests {
         let r = delete(&[t.0.join("l")]);
         assert!(r.errors.is_empty());
         assert!(t.0.join("keep/f").exists());
+    }
+
+    #[test]
+    fn concurrent_pastes_publish_distinct_complete_files() {
+        let t = Tmp::new();
+        let source = t.file("source/item", "complete payload");
+        let destination = t.0.join("target");
+        fs::create_dir(&destination).unwrap();
+        let workers = (0..4)
+            .map(|_| {
+                let source = source.clone();
+                let destination = destination.clone();
+                std::thread::spawn(move || paste(&[source], &destination, Op::Copy, "copy"))
+            })
+            .collect::<Vec<_>>();
+        let mut created = Vec::new();
+        for worker in workers {
+            let report = worker.join().unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            created.extend(report.created);
+        }
+        created.sort();
+        created.dedup();
+        assert_eq!(created.len(), 4);
+        for name in created {
+            assert_eq!(fs::read_to_string(destination.join(name)).unwrap(), "complete payload");
+        }
+    }
+
+    #[test]
+    fn failed_recursive_copy_keeps_source_and_hides_partial_destination() {
+        let t = Tmp::new();
+        t.file("source/file", "original");
+        std::os::unix::fs::symlink("missing", t.0.join("source/link")).unwrap();
+        let fifo = std::ffi::CString::new(t.0.join("source/pipe").as_os_str().as_encoded_bytes()).unwrap();
+        // Ruta válida terminada en NUL, sin referencias retenidas por mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(copy_recursive(&t.0.join("source"), &t.0.join("copy")).is_err());
+        assert!(!exists(&t.0.join("copy")));
+        assert!(
+            !fs::read_dir(&t.0).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b".fex-copy-"))
+        );
+        assert_eq!(fs::read_to_string(t.0.join("source/file")).unwrap(), "original");
+    }
+
+    #[test]
+    fn copying_through_a_symlink_into_itself_is_rejected() {
+        let t = Tmp::new();
+        t.file("directory/sub/file", "original");
+        std::os::unix::fs::symlink(t.0.join("directory/sub"), t.0.join("alias")).unwrap();
+        let report = paste(&[t.0.join("directory")], &t.0.join("alias"), Op::Copy, "copy");
+        assert!(matches!(report.errors.as_slice(), [OpError::IntoItself(_)]));
+    }
+
+    #[test]
+    fn copy_preserves_non_utf8_names() {
+        let t = Tmp::new();
+        let name = OsString::from_vec(b"file-\xff".to_vec());
+        let source = t.0.join("source").join(&name);
+        fs::create_dir(t.0.join("source")).unwrap();
+        fs::create_dir(t.0.join("target")).unwrap();
+        fs::write(&source, "data").unwrap();
+        let report = paste(&[source], &t.0.join("target"), Op::Copy, "copy");
+        assert!(report.errors.is_empty());
+        assert_eq!(report.created, [name.clone()]);
+        assert_eq!(fs::read_to_string(t.0.join("target").join(name)).unwrap(), "data");
+    }
+
+    #[test]
+    fn failed_items_can_be_retried_after_destination_is_fixed() {
+        let t = Tmp::new();
+        let source = t.file("source/item", "original");
+        let destination = t.0.join("not-yet-created");
+        let report = paste(&[source.clone()], &destination, Op::Move, "copy");
+        assert_eq!(report.done, 0);
+        assert!(source.exists());
+        let retry = report.retry.unwrap();
+        fs::create_dir(&destination).unwrap();
+        let report = paste(&retry.sources, &retry.destination, retry.operation, "copy");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(fs::read_to_string(destination.join("item")).unwrap(), "original");
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn copy_preserves_user_attributes_and_modified_time() {
+        use xattr::FileExt;
+        let t = Tmp::new();
+        let source = t.file("source", "data");
+        let source_file = fs::File::open(&source).unwrap();
+        source_file.set_xattr("user.fex-test", b"attribute").unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        source_file.set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        let destination = t.0.join("copied");
+        copy_recursive(&source, &destination).unwrap();
+        let copied = fs::File::open(destination).unwrap();
+        assert_eq!(copied.get_xattr("user.fex-test").unwrap(), Some(b"attribute".to_vec()));
+        assert_eq!(copied.metadata().unwrap().modified().unwrap(), modified);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn move_between_filesystems_keeps_contents_and_removes_only_original() {
+        use std::os::unix::fs::MetadataExt;
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir_in("/dev/shm").unwrap();
+        if source_dir.path().metadata().unwrap().dev() == destination_dir.path().metadata().unwrap().dev() {
+            return;
+        }
+        let source = source_dir.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), "cross-device data").unwrap();
+        let report = paste(&[source.clone()], destination_dir.path(), Op::Move, "copy");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(fs::read_to_string(destination_dir.path().join("tree/data")).unwrap(), "cross-device data");
+        assert!(!source.exists());
     }
 
     #[test]
