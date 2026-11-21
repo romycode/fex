@@ -4,37 +4,48 @@
 //! - La ventana se abre y pinta ANTES de leer el directorio.
 //! - El listado usa solo `getdents` (d_type vía `file_type()`), sin `stat`.
 //! - Tamaños y fechas se rellenan después, en segundo plano.
-//! - El watcher (inotify) se crea tras el primer listado.
+//! - El watcher se crea tras el primer listado.
 //! - Nada de gvfs, temas de iconos ni miniaturas.
 
 mod fs;
 mod i18n;
 mod icons;
 mod input;
+#[cfg(target_os = "macos")]
+mod macos;
 mod ops;
+mod safe_fs;
+mod sidebar;
 mod theme;
 mod undo;
 mod watch;
 
+#[cfg(all(test, feature = "ui-tests", target_os = "linux"))]
+mod ui_tests;
+
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    ffi::{OsStr, OsString},
     io,
     ops::Range,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Div, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
-    Stateful, Subscription, Task, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
-    anchored, deferred, div, prelude::*, px, size, uniform_list, white,
+    AnyElement, App, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Div, FocusHandle, FontFeatures,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Role, ScrollStrategy, SharedString, Stateful,
+    Subscription, Task, Toggled, UniformListScrollHandle, Window, WindowBounds, WindowOptions, anchored, deferred, div,
+    prelude::*, px, relative, size, uniform_list, white,
 };
 use gpui_platform::application;
 
-use fs::{Entry, Kind, Place};
+use fs::{Entry, Kind, Place, SortColumn};
 use i18n::Lang;
 use icons::{Assets, Icon};
 use input::{InputResult, LineInput};
@@ -50,10 +61,15 @@ fn since_start_ms() -> f64 {
 }
 
 const ROW_H: f32 = 30.;
-const SIDEBAR_W: f32 = 200.;
+const FILE_TILE_W: f32 = 20.;
+const SIDEBAR_W: f32 = 184.;
 const COL_SIZE_W: f32 = 84.;
 const COL_DATE_W: f32 = 118.;
 const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+fn shortcut(linux: &'static str, macos: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") { macos } else { linux }
+}
 
 // ----------------------------------------------------------------- estado ---
 
@@ -67,13 +83,42 @@ struct Clip {
 }
 
 struct Rename {
-    original: String,
+    original: OsString,
     input: LineInput,
 }
 
 struct Menu {
     pos: Point<Pixels>,
     on_item: bool,
+}
+
+struct ToolbarTooltip {
+    label: &'static str,
+    shortcut: &'static str,
+    theme: Theme,
+}
+
+impl Render for ToolbarTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow_md()
+            .text_xs()
+            .text_color(t.text)
+            .child(self.label)
+            .when(!self.shortcut.is_empty(), |d| {
+                d.child(div().px_1().rounded_sm().bg(t.control).text_color(t.muted).child(self.shortcut))
+            })
+    }
 }
 
 /// Trabajo en background: una operación o un deshacer.
@@ -97,13 +142,16 @@ struct Explorer {
     cwd: PathBuf,
     home: Option<PathBuf>,
     places: Vec<Place>,
+    pins: Option<Vec<PathBuf>>,
+    disks: Vec<PathBuf>,
+    pin_busy: bool,
     entries: Vec<Entry>,
     /// Fila con el foco de teclado.
     cursor: usize,
     /// Origen de la selección por rango (Shift).
     anchor: usize,
     /// Selección múltiple por nombre (sobrevive a los refrescos). Vacía = solo `cursor`.
-    marked: HashSet<String>,
+    marked: HashSet<OsString>,
     show_hidden: bool,
     mode: Mode,
     lang: Lang,
@@ -114,12 +162,18 @@ struct Explorer {
 
     clip: Option<Clip>,
     renaming: Option<Rename>,
-    pending_rename: Option<String>,
+    location: Option<LineInput>,
+    sort_column: SortColumn,
+    sort_descending: bool,
+    pending_rename: Option<OsString>,
     menu: Option<Menu>,
     confirm: Option<Vec<PathBuf>>,
     busy: Vec<(u64, Job, usize)>,
     undo: Vec<Undo>,
     next_job: u64,
+    progress: Arc<AtomicU64>,
+    operation_errors: Option<Vec<String>>,
+    retry_paste: Option<ops::Retry>,
     notice: Option<Notice>,
 
     watcher: Option<DirWatcher>,
@@ -131,6 +185,7 @@ struct Explorer {
     _stat_task: Option<Task<()>>,
     _notice_task: Option<Task<()>>,
     _watch_task: Task<()>,
+    _sidebar_task: Task<()>,
     _appearance: Subscription,
 }
 
@@ -139,16 +194,51 @@ impl Explorer {
         // Re-pinta cuando el sistema cambia entre claro y oscuro (portal color-scheme).
         let appearance = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
 
-        // Eventos de inotify → refresco con debounce (150 ms) y como mucho ~2.5/s.
+        // Eventos del watcher nativo → refresco con debounce y como mucho ~2.5/s.
         let (watch_tx, mut watch_rx) = mpsc::unbounded::<()>();
         let watch_task = cx.spawn(async move |this, cx| {
             while watch_rx.next().await.is_some() {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 while watch_rx.try_recv().is_ok() {}
-                if this.update(cx, |this, cx| this.reload(Vec::new(), cx)).is_err() {
+                let updated = this.update(cx, |this, cx| {
+                    // Hasta que termine la navegación, el watcher sigue en la ruta anterior.
+                    if !this.loading {
+                        this.reload(Vec::new(), cx);
+                    }
+                });
+                if updated.is_err() {
                     break;
                 }
                 cx.background_executor().timer(Duration::from_millis(250)).await;
+            }
+        });
+        let sidebar_task = cx.spawn(async move |this, cx| {
+            let pins = cx.background_spawn(async { sidebar::load_pins().unwrap_or_default() }).await;
+            if this
+                .update(cx, |this, cx| {
+                    this.pins = Some(pins);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                let disks = cx.background_spawn(async { sidebar::mounted_disks() }).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if let Ok(disks) = disks
+                            && this.disks != disks
+                        {
+                            this.disks = disks;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(3)).await;
             }
         });
 
@@ -156,6 +246,9 @@ impl Explorer {
             cwd: PathBuf::new(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             places: fs::places(),
+            pins: None,
+            disks: Vec::new(),
+            pin_busy: false,
             entries: Vec::new(),
             cursor: 0,
             anchor: 0,
@@ -169,12 +262,18 @@ impl Explorer {
             status_count: None,
             clip: None,
             renaming: None,
+            location: None,
+            sort_column: SortColumn::Name,
+            sort_descending: false,
             pending_rename: None,
             menu: None,
             confirm: None,
             busy: Vec::new(),
             undo: Vec::new(),
             next_job: 0,
+            progress: Arc::new(AtomicU64::new(0)),
+            operation_errors: None,
+            retry_paste: None,
             notice: None,
             watcher: None,
             watch_tx,
@@ -184,6 +283,7 @@ impl Explorer {
             _stat_task: None,
             _notice_task: None,
             _watch_task: watch_task,
+            _sidebar_task: sidebar_task,
             _appearance: appearance,
         };
         this.navigate(cwd, None, cx);
@@ -192,10 +292,18 @@ impl Explorer {
 
     // ------------------------------------------------------ navegación ----
 
-    fn navigate(&mut self, dir: PathBuf, select: Option<String>, cx: &mut Context<Self>) {
+    fn navigate(&mut self, dir: PathBuf, select: Option<OsString>, cx: &mut Context<Self>) {
         let refresh = dir == self.cwd;
         if !refresh {
+            // Las filas y las acciones pendientes pertenecen al directorio anterior.
+            self.entries.clear();
+            self.cursor = 0;
+            self.anchor = 0;
+            self.marked.clear();
+            self.status_count = None;
             self.renaming = None;
+            self.pending_rename = None;
+            self.confirm = None;
         }
         self.menu = None;
         self.load(dir, refresh, select.into_iter().collect(), cx);
@@ -203,11 +311,11 @@ impl Explorer {
 
     /// Relee el directorio actual sin perder selección ni scroll.
     /// `select` no vacío → esos nombres quedan seleccionados (tras pegar, renombrar…).
-    fn reload(&mut self, select: Vec<String>, cx: &mut Context<Self>) {
+    fn reload(&mut self, select: Vec<OsString>, cx: &mut Context<Self>) {
         self.load(self.cwd.clone(), true, select, cx);
     }
 
-    fn load(&mut self, dir: PathBuf, refresh: bool, select: Vec<String>, cx: &mut Context<Self>) {
+    fn load(&mut self, dir: PathBuf, refresh: bool, select: Vec<OsString>, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
         self.cwd = dir.clone();
@@ -255,21 +363,22 @@ impl Explorer {
         &mut self,
         entries: Vec<Entry>,
         refresh: bool,
-        select: Vec<String>,
+        select: Vec<OsString>,
         took: Duration,
         generation: u64,
         cx: &mut Context<Self>,
     ) {
         let prev_cursor = self.entries.get(self.cursor).map(|e| e.name.clone());
         self.entries = entries;
+        fs::sort_entries(&mut self.entries, self.sort_column, self.sort_descending);
         self.error = None;
-        let pos = |name: &str, entries: &[Entry]| entries.iter().position(|e| e.name == name);
+        let pos = |name: &OsStr, entries: &[Entry]| entries.iter().position(|e| e.name == name);
 
         if refresh {
             if select.is_empty() {
                 if !self.marked.is_empty() {
-                    let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
-                    self.marked.retain(|n| names.contains(n.as_str()));
+                    let names: HashSet<&OsStr> = self.entries.iter().map(|e| e.name.as_os_str()).collect();
+                    self.marked.retain(|n| names.contains(n.as_os_str()));
                 }
             } else {
                 self.marked = select.iter().filter(|n| pos(n, &self.entries).is_some()).cloned().collect();
@@ -295,7 +404,7 @@ impl Explorer {
             && let Some(ix) = pos(&name, &self.entries)
         {
             self.cursor = ix;
-            let mut input = LineInput::new(name.clone(), 0);
+            let mut input = LineInput::new(name.to_string_lossy().into_owned(), 0);
             input.select_all();
             self.renaming = Some(Rename { original: name, input });
         }
@@ -321,7 +430,7 @@ impl Explorer {
 
     fn start_stat_pass(&mut self, generation: u64, cx: &mut Context<Self>) {
         let dir = self.cwd.clone();
-        let names: Vec<String> = self.entries.iter().map(|e| e.name.clone()).collect();
+        let names: Vec<OsString> = self.entries.iter().map(|e| e.name.clone()).collect();
         let stats = cx.background_spawn(async move { fs::stat_all(&dir, names) });
         self._stat_task = Some(cx.spawn(async move |this, cx| {
             let stats = stats.await;
@@ -329,14 +438,59 @@ impl Explorer {
                 if this.generation != generation || stats.len() != this.entries.len() {
                     return;
                 }
-                for (e, (size, modified)) in this.entries.iter_mut().zip(stats) {
-                    e.size = size;
-                    e.modified = modified;
+                let stats: HashMap<_, _> =
+                    stats.into_iter().map(|(name, size, modified)| (name, (size, modified))).collect();
+                for entry in &mut this.entries {
+                    if let Some(&(size, modified)) = stats.get(&entry.name) {
+                        entry.size = size;
+                        entry.modified = modified;
+                    }
                 }
+                this.sort_listing();
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    fn sort_listing(&mut self) {
+        let selected = self.entries.get(self.cursor).map(|entry| entry.name.clone());
+        fs::sort_entries(&mut self.entries, self.sort_column, self.sort_descending);
+        self.cursor = selected.and_then(|name| self.entries.iter().position(|entry| entry.name == name)).unwrap_or(0);
+        self.anchor = self.cursor;
+    }
+
+    fn change_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
+        if self.sort_column == column {
+            self.sort_descending = !self.sort_descending;
+        } else {
+            self.sort_column = column;
+            self.sort_descending = false;
+        }
+        self.sort_listing();
+        self.scroll.scroll_to_item(self.cursor, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    fn edit_location(&mut self, cx: &mut Context<Self>) {
+        let mut input = LineInput::new(self.cwd.to_string_lossy().into_owned(), 0);
+        input.select_all();
+        self.location = Some(input);
+        self.renaming = None;
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn commit_location(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.location.take() else { return };
+        let path = if input.text == "~" {
+            self.home.clone().unwrap_or_else(|| self.cwd.clone())
+        } else if let Some(suffix) = input.text.strip_prefix("~/") {
+            self.home.as_ref().unwrap_or(&self.cwd).join(suffix)
+        } else {
+            self.cwd.join(&input.text)
+        };
+        self.navigate(path, None, cx);
     }
 
     fn open_cursor(&mut self, cx: &mut Context<Self>) {
@@ -347,14 +501,15 @@ impl Explorer {
         } else {
             // En un hilo aparte para recoger el proceso (sin zombis) y no bloquear.
             std::thread::spawn(move || {
-                let _ = std::process::Command::new("xdg-open").arg(path).status();
+                let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+                let _ = std::process::Command::new(opener).arg(path).status();
             });
         }
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let Some(parent) = self.cwd.parent().map(Path::to_path_buf) else { return };
-        let came_from = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned());
+        let came_from = self.cwd.file_name().map(OsStr::to_os_string);
         self.navigate(parent, came_from, cx);
     }
 
@@ -373,13 +528,40 @@ impl Explorer {
         cx.notify();
     }
 
+    fn toggle_pin(&mut self, cx: &mut Context<Self>) {
+        let Some(pins) = &self.pins else { return };
+        let pinned = !pins.contains(&self.cwd);
+        self.set_pinned(self.cwd.clone(), pinned, cx);
+    }
+
+    fn set_pinned(&mut self, path: PathBuf, pinned: bool, cx: &mut Context<Self>) {
+        if self.pin_busy {
+            return;
+        }
+        self.pin_busy = true;
+        let task = cx.background_spawn(async move { sidebar::set_pinned(&path, pinned) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pin_busy = false;
+                match result {
+                    Ok(pins) => this.pins = Some(pins),
+                    Err(error) => this.set_notice(Notice::Error(format!("{}: {error}", this.lang.t().pin_error)), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // ------------------------------------------------------- selección ----
 
-    fn is_selected(&self, ix: usize, name: &str) -> bool {
+    fn is_selected(&self, ix: usize, name: &OsStr) -> bool {
         if self.marked.is_empty() { ix == self.cursor } else { self.marked.contains(name) }
     }
 
-    fn target_names(&self) -> Vec<String> {
+    fn target_names(&self) -> Vec<OsString> {
         if self.marked.is_empty() {
             self.entries.get(self.cursor).map(|e| vec![e.name.clone()]).unwrap_or_default()
         } else {
@@ -435,7 +617,7 @@ impl Explorer {
             self.commit_rename(cx);
         }
         let m = ev.modifiers();
-        if m.control {
+        if if cfg!(target_os = "macos") { m.platform } else { m.control } {
             self.seed_marks();
             if !self.marked.remove(&name) {
                 self.marked.insert(name);
@@ -470,7 +652,13 @@ impl Explorer {
     // ------------------------------------------------------ operaciones ----
 
     fn set_notice(&mut self, notice: Notice, cx: &mut Context<Self>) {
+        let is_error = matches!(notice, Notice::Error(_));
         self.notice = Some(notice);
+        if is_error {
+            self._notice_task = None;
+            cx.notify();
+            return;
+        }
         self._notice_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(NOTICE_TTL).await;
             this.update(cx, |this, cx| {
@@ -507,22 +695,62 @@ impl Explorer {
         job: Job,
         n: usize,
         work: impl FnOnce() -> ops::Report + Send + 'static,
-        make_undo: impl FnOnce(&ops::Report) -> Option<Undo> + 'static,
+        make_undo: impl FnOnce(&ops::Report) -> Option<Undo> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if !self.busy.is_empty() {
+            return;
+        }
+        let cwd = self.cwd.clone();
         let id = self.next_job;
         self.next_job += 1;
+        self.progress.store(0, Ordering::Relaxed);
         self.busy.push((id, job, n));
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let active = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.busy.iter().any(|(job_id, ..)| *job_id == id)
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
         self.menu = None;
         cx.notify();
 
-        let task = cx.background_spawn(async move { work() });
+        let task = cx.background_spawn(async move {
+            let mut report = work();
+            let undo = match make_undo(&report).map(Undo::guard) {
+                Some(Ok(undo)) => Some(undo),
+                Some(Err(error)) => {
+                    report.errors.push(OpError::Io("Undo".into(), error));
+                    None
+                }
+                None => None,
+            };
+            (report, undo)
+        });
         cx.spawn(async move |this, cx| {
-            let report = task.await;
+            let (report, undo) = task.await;
             this.update(cx, |this, cx| {
                 this.busy.retain(|(i, ..)| *i != id);
-                if let Some(u) = make_undo(&report) {
+                if let Some(u) = undo {
                     this.push_undo(u);
+                }
+                this.retry_paste = report.retry.clone();
+                if !report.errors.is_empty() {
+                    let mut details = vec![match job {
+                        Job::Op(op) => this.lang.done(op, report.done),
+                        Job::Undo(_) => this.lang.t().undo.into(),
+                    }];
+                    details.extend(report.errors.iter().map(|error| this.describe_errors(std::slice::from_ref(error))));
+                    this.operation_errors = Some(details);
                 }
                 let notice = match (report.errors.is_empty(), job) {
                     (false, _) => Notice::Error(this.describe_errors(&report.errors)),
@@ -530,7 +758,15 @@ impl Explorer {
                     (true, Job::Undo(k)) => Notice::Undone(k),
                 };
                 this.set_notice(notice, cx);
-                this.reload(report.created, cx);
+                let selected = report
+                    .created_paths
+                    .iter()
+                    .filter(|path| path.parent() == Some(this.cwd.as_path()))
+                    .filter_map(|path| path.file_name().map(OsStr::to_os_string))
+                    .collect::<Vec<_>>();
+                if this.cwd == cwd || !selected.is_empty() {
+                    this.reload(selected, cx);
+                }
             })
             .ok();
         })
@@ -539,13 +775,23 @@ impl Explorer {
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
+        if !self.busy.is_empty() {
+            return;
+        }
         let Some(u) = self.undo.pop() else {
             self.set_notice(Notice::Info(self.lang.t().nothing_to_undo), cx);
             return;
         };
         self.clip = None; // las rutas del portapapeles pueden dejar de ser válidas
         let kind = u.kind();
-        self.run_job(Job::Undo(kind), 1, move || u.revert(), |_| None, cx);
+        let retry = u.clone();
+        self.run_job(
+            Job::Undo(kind),
+            1,
+            move || u.revert(),
+            move |report| (report.done == 0 && !report.errors.is_empty()).then_some(retry),
+            cx,
+        );
     }
 
     fn copy_or_cut(&mut self, op: Op, cx: &mut Context<Self>) {
@@ -562,28 +808,46 @@ impl Explorer {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let system = cx.read_from_clipboard().and_then(|c| c.text());
-        let parsed = match (&self.clip, system) {
-            (Some(c), Some(t)) if t == c.text => Some((c.paths.clone(), c.op)),
-            (_, Some(t)) => ops::parse_clipboard(&t),
-            (Some(c), None) => Some((c.paths.clone(), c.op)),
-            (None, None) => None,
-        };
+        if !self.busy.is_empty() {
+            return;
+        }
+        let system = cx.read_from_clipboard();
+        let paths = system.as_ref().and_then(|clipboard| {
+            clipboard.entries.iter().find_map(|entry| match entry {
+                ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths.paths().to_vec()),
+                _ => None,
+            })
+        });
+        let parsed = paths.map(|paths| (paths, Op::Copy)).or_else(|| {
+            match (&self.clip, system.and_then(|clipboard| clipboard.text())) {
+                (Some(c), Some(t)) if t == c.text => Some((c.paths.clone(), c.op)),
+                (_, Some(t)) => ops::parse_clipboard(&t),
+                (Some(c), None) => Some((c.paths.clone(), c.op)),
+                (None, None) => None,
+            }
+        });
         let Some((paths, op)) = parsed else {
             self.menu = None;
             self.set_notice(Notice::Info(self.lang.t().nothing_to_paste), cx);
             return;
         };
-        if op == Op::Move {
-            self.clip = None; // cortar se consume al pegar
+        self.paste_paths(paths, self.cwd.clone(), op, cx);
+    }
+
+    fn paste_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, op: Op, cx: &mut Context<Self>) {
+        if !self.busy.is_empty() {
+            return;
         }
-        let dest = self.cwd.clone();
+        if op == Op::Move {
+            self.clip = None;
+        }
+        let progress = self.progress.clone();
         let label = self.lang.t().copy_suffix;
         let n = paths.len();
         self.run_job(
             Job::Op(op),
             n,
-            move || ops::paste(&paths, &dest, op, label),
+            move || ops::paste_progress(&paths, &dest, op, label, Some(&progress)),
             move |r| {
                 let pairs = r.pairs.clone();
                 match op {
@@ -599,12 +863,11 @@ impl Explorer {
     fn trash_selection(&mut self, cx: &mut Context<Self>) {
         let paths = self.target_paths();
         if !paths.is_empty() {
-            let since = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
             self.run_job(
                 Job::Op(Op::Trash),
                 paths.len(),
                 move || ops::trash(&paths),
-                move |r| (!r.trashed.is_empty()).then(|| Undo::Trash { paths: r.trashed.clone(), since }),
+                move |r| (!r.trashed.is_empty()).then(|| Undo::Trash { paths: r.trashed.clone() }),
                 cx,
             );
         }
@@ -626,9 +889,15 @@ impl Explorer {
     }
 
     fn start_rename(&mut self, cx: &mut Context<Self>) {
+        if !self.busy.is_empty() {
+            return;
+        }
         let Some(e) = self.entries.get(self.cursor) else { return };
-        let stem = ops::stem_len(&e.name, e.kind.is_dir());
-        self.renaming = Some(Rename { original: e.name.clone(), input: LineInput::new(e.name.clone(), stem) });
+        let stem = ops::stem_len(&e.name.to_string_lossy(), e.kind.is_dir());
+        self.renaming = Some(Rename {
+            original: e.name.clone(),
+            input: LineInput::new(e.name.to_string_lossy().into_owned(), stem),
+        });
         self.marked.clear();
         self.menu = None;
         cx.notify();
@@ -641,14 +910,21 @@ impl Explorer {
         match ops::rename(&self.cwd, &r.original, &new) {
             Ok(()) => {
                 // Renombrar una carpeta recién creada: un único paso de deshacer.
-                let fresh = matches!(self.undo.last(), Some(Undo::NewFolder { path }) if *path == self.cwd.join(&r.original));
+                let fresh = self.undo.last().is_some_and(|undo| undo.is_new_folder(&self.cwd.join(&r.original)));
                 if fresh {
                     self.undo.pop();
-                    self.push_undo(Undo::NewFolder { path: self.cwd.join(&new) });
-                } else if new != r.original {
-                    self.push_undo(Undo::Rename { dir: self.cwd.clone(), from: r.original.clone(), to: new.clone() });
+                    if let Ok(undo) = (Undo::NewFolder { path: self.cwd.join(&new) }).guard() {
+                        self.push_undo(undo);
+                    }
+                } else if OsStr::new(&new) != r.original {
+                    if let Ok(undo) =
+                        (Undo::Rename { dir: self.cwd.clone(), from: r.original.clone(), to: new.clone().into() })
+                            .guard()
+                    {
+                        self.push_undo(undo);
+                    }
                 }
-                self.reload(vec![new], cx)
+                self.reload(vec![new.into()], cx)
             }
             Err(NameError::Invalid) => {
                 self.renaming = Some(r); // dejar corregirlo
@@ -658,17 +934,24 @@ impl Explorer {
                 self.renaming = Some(r);
                 self.set_notice(Notice::Error(self.lang.exists(&n)), cx);
             }
-            Err(NameError::Io(e)) => self.set_notice(Notice::Error(format!("{}: {e}", r.original)), cx),
+            Err(NameError::Io(e)) => {
+                self.set_notice(Notice::Error(format!("{}: {e}", r.original.to_string_lossy())), cx)
+            }
         }
         cx.notify();
     }
 
     fn new_folder(&mut self, cx: &mut Context<Self>) {
+        if !self.busy.is_empty() {
+            return;
+        }
         self.menu = None;
         self.renaming = None;
         match ops::mkdir(&self.cwd, self.lang.t().new_folder) {
             Ok(name) => {
-                self.push_undo(Undo::NewFolder { path: self.cwd.join(&name) });
+                if let Ok(undo) = (Undo::NewFolder { path: self.cwd.join(&name) }).guard() {
+                    self.push_undo(undo);
+                }
                 self.pending_rename = Some(name.clone());
                 self.reload(vec![name], cx);
             }
@@ -683,9 +966,37 @@ impl Explorer {
         let k = &ev.keystroke;
         let m = &k.modifiers;
         let key = k.key.as_str();
+        let command = if cfg!(target_os = "macos") { m.platform } else { m.control && !m.platform };
+
+        if self.operation_errors.is_some() {
+            if key == "escape" || key == "enter" {
+                self.operation_errors = None;
+                cx.notify();
+            }
+            return;
+        }
+
+        if let Some(input) = &mut self.location {
+            match (command, key) {
+                (true, "v") => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        input.insert(text.lines().next().unwrap_or(""));
+                    }
+                }
+                (true, "a") => input.select_all(),
+                (true, "l") => input.select_all(),
+                _ => match input.key(key, k.key_char.as_deref(), command || m.control) {
+                    InputResult::Commit => self.commit_location(cx),
+                    InputResult::Cancel => self.location = None,
+                    InputResult::Continue => {}
+                },
+            }
+            cx.notify();
+            return;
+        }
 
         if let Some(r) = &mut self.renaming {
-            match (m.control, key) {
+            match (command, key) {
                 (true, "v") => {
                     if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
                         r.input.insert(t.lines().next().unwrap_or(""));
@@ -712,22 +1023,27 @@ impl Explorer {
             return;
         }
 
-        if m.platform {
-            return;
-        }
-        if m.control {
+        if command {
             match (m.shift, key) {
+                (false, "backspace") if cfg!(target_os = "macos") => self.trash_selection(cx),
+                (true, "backspace") if cfg!(target_os = "macos") => self.ask_delete(cx),
                 (false, "c") => self.copy_or_cut(Op::Copy, cx),
+                (false, "d") => self.toggle_pin(cx),
+                (false, "l") => self.edit_location(cx),
                 (false, "x") => self.copy_or_cut(Op::Move, cx),
                 (false, "v") => self.paste(cx),
                 (false, "a") => self.select_all(cx),
-                (false, "h") => self.toggle_hidden(cx),
+                (false, "h") if cfg!(target_os = "linux") => self.toggle_hidden(cx),
+                (true, "." | ">") if cfg!(target_os = "macos") => self.toggle_hidden(cx),
                 (false, "r") => self.reload(Vec::new(), cx),
                 (true, "n") => self.new_folder(cx),
                 (false, "z") => self.undo_last(cx),
-                (false, "q") => cx.quit(),
+                (false, "q") if self.busy.is_empty() => cx.quit(),
                 _ => {}
             }
+            return;
+        }
+        if m.platform || m.control {
             return;
         }
 
@@ -750,7 +1066,7 @@ impl Explorer {
             (_, _, ".") => self.toggle_hidden(cx),
             (_, _, "t") => self.cycle_theme(cx),
             (_, _, "i") => self.cycle_lang(cx),
-            (_, _, "q") => cx.quit(),
+            (_, _, "q") if self.busy.is_empty() => cx.quit(),
             (_, _, "escape") => {
                 if self.menu.take().is_none() {
                     self.marked.clear();
@@ -763,52 +1079,125 @@ impl Explorer {
 
     // ---------------------------------------------------------- render ----
 
-    fn render_sidebar(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&self, t: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let s = self.lang.t();
-        let items = self.places.iter().enumerate().map(|(i, place)| {
-            let active = self.cwd == place.path;
-            let path = place.path.clone();
+        let pins = self.pins.as_deref().unwrap_or_default();
+        let current = self
+            .places
+            .iter()
+            .map(|place| ("place", &place.path))
+            .chain(self.disks.iter().map(|path| ("disk", path)))
+            .chain(pins.iter().map(|path| ("pin", path)))
+            .filter(|(_, path)| self.cwd.starts_with(path) && (path.as_path() != Path::new("/") || &self.cwd == *path))
+            .max_by_key(|(_, path)| path.as_os_str().len());
+
+        let row = |section, i, path: &PathBuf, label: SharedString, icon: Icon, cx: &mut Context<Self>| {
+            let active = current == Some((section, path));
+            let target = path.clone();
             div()
-                .id(SharedString::from(format!("place-{i}")))
-                .h(px(30.))
+                .id(SharedString::from(format!("{section}-{i}")))
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .aria_description(path.display().to_string())
+                .h(px(34.))
+                .flex_1()
+                .min_w_0()
                 .px_2()
                 .flex()
                 .items_center()
                 .gap_2p5()
-                .rounded_md()
+                .rounded_lg()
                 .cursor_pointer()
                 .text_color(if active { t.text } else { t.muted })
                 .when(active, |d| d.bg(t.selection).font_weight(FontWeight::MEDIUM))
                 .when(!active, |d| d.hover(|d| d.bg(t.hover)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.navigate(path.clone(), None, cx);
+                    this.navigate(target.clone(), None, cx);
                 }))
-                .child(place.icon.el(16.).text_color(if active { t.accent } else { t.faint }))
-                .child(place.id.label(s))
-        });
+                .child(icon.el(15.).text_color(if active { t.accent } else { t.faint }))
+                .child(div().min_w_0().truncate().child(label))
+        };
+        let path_label = |path: &Path| -> SharedString {
+            path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned().into()
+        };
+        let heading = |label| {
+            div()
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.muted)
+                .child(label)
+        };
+        let empty = |label| div().px_2().py_1().text_xs().text_color(t.faint).child(label);
+        let places = self
+            .places
+            .iter()
+            .enumerate()
+            .map(|(i, place)| row("place", i, &place.path, place.id.label(s).into(), place.icon, cx))
+            .collect::<Vec<_>>();
+        let pinned = pins
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let link = row("pin", i, path, path_label(path), Icon::Folder, cx);
+                let target = path.clone();
+                div().id(SharedString::from(format!("pin-row-{i}"))).flex().items_center().gap_0p5().child(link).child(
+                    Self::toolbar_button("remove", Icon::Close, s.unpin_folder, "", false, *t).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.set_pinned(target.clone(), false, cx);
+                        },
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        let disks = self
+            .disks
+            .iter()
+            .enumerate()
+            .map(|(i, path)| row("disk", i, path, path_label(path), Icon::System, cx))
+            .collect::<Vec<_>>();
+        let current_pinned = pins.contains(&self.cwd);
+        let pin_button = Self::toolbar_button(
+            "pin-current",
+            Icon::Pin,
+            if current_pinned { s.unpin_folder } else { s.pin_folder },
+            shortcut("Ctrl+D", "⌘D"),
+            current_pinned,
+            *t,
+        )
+        .aria_toggled(if current_pinned { Toggled::True } else { Toggled::False })
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_pin(cx)));
 
         div()
+            .id("sidebar")
             .w(px(SIDEBAR_W))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .gap_0p5()
-            .px_2()
-            .pt_3()
-            .bg(t.sidebar)
-            .border_r_1()
-            .border_color(t.border)
+            .gap_3()
+            .px_3()
+            .py_3()
+            .overflow_y_scroll()
+            .child(div().flex_none().child(heading(s.places)).children(places))
             .child(
                 div()
-                    .px_2()
-                    .pb_1p5()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(t.faint)
-                    .child(s.places),
+                    .flex_none()
+                    .child(heading(s.pins).child(pin_button))
+                    .when(pins.is_empty(), |d| d.child(empty(s.no_pins)))
+                    .children(pinned),
             )
-            .children(items)
+            .child(
+                div()
+                    .flex_none()
+                    .child(heading(s.disks))
+                    .when(disks.is_empty(), |d| d.child(empty(s.no_disks)))
+                    .children(disks),
+            )
     }
 
     /// Segmentos de la ruta actual, con "Inicio" para HOME y "…" si hay demasiados.
@@ -835,46 +1224,69 @@ impl Explorer {
         out
     }
 
-    fn button(&self, id: &'static str, icon: Icon, label: Option<&'static str>, active: bool, t: &Theme) -> Stateful<Div> {
-        let fg = if active { t.accent } else { t.muted };
+    fn toolbar_button(
+        id: &'static str,
+        icon: Icon,
+        label: &'static str,
+        shortcut: &'static str,
+        active: bool,
+        t: Theme,
+    ) -> Stateful<Div> {
         div()
             .id(id)
-            .h(px(28.))
-            .when(label.is_some(), |d| d.px_2p5())
-            .when(label.is_none(), |d| d.w(px(28.)).justify_center())
+            .role(Role::Button)
+            .aria_label(label)
+            .size(px(28.))
+            .flex_none()
             .flex()
             .items_center()
-            .gap_1p5()
+            .justify_center()
             .rounded_md()
             .cursor_pointer()
-            .text_sm()
-            .text_color(fg)
-            .bg(if active { t.selection } else { t.control })
-            .hover(|d| d.bg(t.hover))
-            .child(icon.el(15.).text_color(fg))
-            .children(label)
+            .when(active, |d| d.bg(t.selection))
+            .hover(|d| d.bg(if active { t.selection } else { t.hover }))
+            .child(icon.el(16.).text_color(if active { t.accent } else { t.muted }))
+            .tooltip(move |_, cx| cx.new(|_| ToolbarTooltip { label, shortcut, theme: t }).into())
     }
 
     fn render_toolbar(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
         let crumbs = self.crumbs();
         let last = crumbs.len() - 1;
-        let mut trail = div().flex_1().min_w_0().flex().items_center().gap_0p5().overflow_hidden();
+        let mut trail = div()
+            .flex_1()
+            .min_w_0()
+            .h(px(34.))
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(t.border)
+            .bg(t.path_bg)
+            .overflow_hidden();
         for (i, (label, path)) in crumbs.into_iter().enumerate() {
             if i > 0 {
-                trail = trail.child(Icon::ChevronRight.el(13.).text_color(t.faint));
+                trail = trail.child(Icon::ChevronRight.el(11.).text_color(t.faint));
             }
             let is_last = i == last;
             trail = trail.child(
                 div()
                     .id(SharedString::from(format!("crumb-{i}")))
-                    .flex_none()
+                    .min_w_0()
                     .px_1p5()
                     .py_0p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .whitespace_nowrap()
                     .text_color(if is_last { t.text } else { t.muted })
-                    .when(is_last, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .when(is_last, |d| {
+                        d.flex_shrink_0()
+                            .max_w(relative(if last > 0 { 0.6 } else { 1. }))
+                            .bg(t.selection)
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!is_last, |d| d.max_w(px(110.)))
+                    .truncate()
                     .hover(|d| d.bg(t.hover).text_color(t.text))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.navigate(path.clone(), None, cx);
@@ -883,55 +1295,117 @@ impl Explorer {
             );
         }
 
-        let (theme_icon, theme_label) = self.mode.label(self.lang.t());
+        if let Some(input) = &self.location {
+            let (before, selected, after) = input.parts();
+            trail = div()
+                .flex_1()
+                .min_w_0()
+                .h(px(34.))
+                .px_2()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .rounded_md()
+                .border_1()
+                .border_color(t.accent)
+                .bg(t.path_bg)
+                .child(SharedString::from(before.to_owned()))
+                .child(div().bg(t.text_selection).child(SharedString::from(selected.to_owned())))
+                .child(div().w(px(1.)).h(px(18.)).bg(t.accent))
+                .child(SharedString::from(after.to_owned()));
+        }
+        let s = self.lang.t();
+        let (theme_icon, theme_label) = self.mode.label(s);
+        let actions = div()
+            .h(px(34.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .px_0p5()
+            .border_1()
+            .border_color(t.border)
+            .rounded_md()
+            .child(
+                Self::toolbar_button(
+                    "new-folder",
+                    Icon::FolderPlus,
+                    s.new_folder,
+                    shortcut("Ctrl+Shift+N", "⇧⌘N"),
+                    false,
+                    *t,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_folder(cx))),
+            )
+            .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(t.border))
+            .child(
+                Self::toolbar_button("hidden", Icon::Eye, s.hidden, shortcut("Ctrl+H", "⇧⌘."), self.show_hidden, *t)
+                    .aria_toggled(if self.show_hidden { Toggled::True } else { Toggled::False })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_hidden(cx))),
+            )
+            .child(
+                Self::toolbar_button("theme", theme_icon, theme_label, "T", false, *t)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(cx))),
+            );
+
         div()
             .flex_none()
-            .h(px(48.))
+            .h(px(56.))
             .px_3()
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
-            .border_color(t.border)
             .child(
-                self.button("up", Icon::ArrowUp, None, false, t)
+                Self::toolbar_button("up", Icon::ArrowUp, s.go_up, shortcut("Alt+↑", "⌥↑"), false, *t)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.go_up(cx))),
             )
             .child(trail)
-            .child(
-                self.button("new-folder", Icon::FolderPlus, None, false, t)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_folder(cx))),
-            )
-            .child(
-                self.button("hidden", Icon::Eye, Some(self.lang.t().hidden), self.show_hidden, t)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_hidden(cx))),
-            )
-            .child(
-                self.button("theme", theme_icon, Some(theme_label), false, t)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(cx))),
-            )
+            .child(actions)
     }
 
-    fn render_column_header(&self, t: &Theme) -> Div {
+    fn render_column_header(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
         let s = self.lang.t();
+        let header = |id, label: &'static str, column, cx: &mut Context<Self>| {
+            let marker = if self.sort_column != column {
+                ""
+            } else if self.sort_descending {
+                " ↓"
+            } else {
+                " ↑"
+            };
+            div()
+                .id(id)
+                .cursor_pointer()
+                .text_color(if self.sort_column == column { t.text } else { t.muted })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.change_sort(column, cx)))
+                .child(SharedString::from(format!("{label}{marker}")))
+        };
         div()
             .flex_none()
-            .h(px(30.))
+            .h(px(34.))
             .mx_2()
-            .px_2()
+            .px(px(9.))
             .flex()
             .items_center()
             .gap_3()
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
-            .text_color(t.faint)
-            .child(div().w(px(26.)).flex_none())
-            .child(div().flex_1().child(s.col_name))
-            .child(div().w(px(COL_SIZE_W)).flex_none().text_right().child(s.col_size))
-            .child(div().w(px(COL_DATE_W)).flex_none().text_right().child(s.col_modified))
+            .border_b_1()
+            .border_color(t.border)
+            .text_color(t.muted)
+            .child(div().w(px(FILE_TILE_W)).flex_none())
+            .child(header("sort-name", s.col_name, SortColumn::Name, cx).flex_1())
+            .child(header("sort-size", s.col_size, SortColumn::Size, cx).w(px(COL_SIZE_W)).flex_none().text_right())
+            .child(
+                header("sort-date", s.col_modified, SortColumn::Modified, cx)
+                    .w(px(COL_DATE_W))
+                    .flex_none()
+                    .text_right(),
+            )
     }
 
-    fn render_name(&self, e: &Entry, t: &Theme) -> AnyElement {
+    fn render_name(&self, e: &Entry, is_cut: bool, t: &Theme) -> AnyElement {
         if let Some(r) = self.renaming.as_ref().filter(|r| r.original == e.name) {
             let (pre, sel, post) = r.input.parts();
             let caret = div().flex_none().w(px(1.5)).h(px(16.)).bg(t.accent);
@@ -961,20 +1435,27 @@ impl Explorer {
             .min_w_0()
             .truncate()
             .text_color(if e.kind == Kind::Other { t.muted } else { t.text })
+            .when(is_cut, |d| d.opacity(0.55))
             .when(e.kind.is_dir(), |d| d.font_weight(FontWeight::MEDIUM))
-            .child(SharedString::from(e.name.clone()))
+            .child(SharedString::from(e.name.to_string_lossy().into_owned()))
             .into_any_element()
     }
 
     fn render_rows(&mut self, range: Range<usize>, window: &Window, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
         let t = self.mode.resolve(window.appearance());
         let lang = self.lang;
-        let multi = !self.marked.is_empty();
+        static TABULAR_NUMBERS: OnceLock<FontFeatures> = OnceLock::new();
+        let tabular_numbers = TABULAR_NUMBERS.get_or_init(|| FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
+        let list_focused = window.is_window_active()
+            && self.focus.is_focused(window)
+            && self.confirm.is_none()
+            && self.renaming.is_none();
         let cut = self.clip.as_ref().filter(|c| c.op == Op::Move).map(|c| &c.set);
         range
             .filter_map(|ix| self.entries.get(ix).map(|e| (ix, e)))
             .map(|(ix, e)| {
                 let selected = self.is_selected(ix, &e.name);
+                let focused = list_focused && ix == self.cursor;
                 let is_cut = cut.is_some_and(|set| set.contains(&self.cwd.join(&e.name)));
                 div()
                     .id(ix)
@@ -986,10 +1467,9 @@ impl Explorer {
                     .gap_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(if multi && ix == self.cursor { alpha(t.accent, 0.5) } else { alpha(t.accent, 0.) })
+                    .border_color(if focused { t.accent } else { alpha(t.accent, 0.) })
                     .when(selected, |d| d.bg(t.selection))
                     .when(!selected, |d| d.hover(|d| d.bg(t.hover)))
-                    .when(is_cut, |d| d.opacity(0.45))
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _w, cx| this.click_row(ix, ev, cx)))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -998,13 +1478,15 @@ impl Explorer {
                             cx.stop_propagation();
                         }),
                     )
-                    .child(file_tile(e, &t))
-                    .child(self.render_name(e, &t))
+                    .child(file_tile(e, &t).when(is_cut, |d| d.opacity(0.45)))
+                    .child(self.render_name(e, is_cut, &t))
                     .child(
                         div()
                             .w(px(COL_SIZE_W))
                             .flex_none()
                             .text_right()
+                            .text_xs()
+                            .font_features(tabular_numbers.clone())
                             .text_color(t.muted)
                             .child(match (e.kind.is_dir(), e.size) {
                                 (true, _) => SharedString::from("—"),
@@ -1017,6 +1499,7 @@ impl Explorer {
                             .w(px(COL_DATE_W))
                             .flex_none()
                             .text_right()
+                            .text_xs()
                             .text_color(t.muted)
                             .child(e.modified.map(|m| age(lang, m)).unwrap_or_default()),
                     )
@@ -1031,6 +1514,8 @@ impl Explorer {
             Lang::Es => ("Supr", "Mayús+Supr"),
             Lang::Ca => ("Supr", "Maj+Supr"),
         };
+        let del = shortcut(del, "⌘⌫");
+        let shift_del = shortcut(shift_del, "⇧⌘⌫");
         let single = self.target_names().len() == 1;
 
         // None = separador.
@@ -1040,9 +1525,13 @@ impl Explorer {
                 items.push(Some((Icon::Open, s.open, "⏎", false, |this, cx| this.open_cursor(cx))));
                 items.push(None);
             }
-            items.push(Some((Icon::Cut, s.cut, "Ctrl+X", false, |this, cx| this.copy_or_cut(Op::Move, cx))));
-            items.push(Some((Icon::Copy, s.copy, "Ctrl+C", false, |this, cx| this.copy_or_cut(Op::Copy, cx))));
-            items.push(Some((Icon::Paste, s.paste, "Ctrl+V", false, |this, cx| this.paste(cx))));
+            items.push(Some((Icon::Cut, s.cut, shortcut("Ctrl+X", "⌘X"), false, |this, cx| {
+                this.copy_or_cut(Op::Move, cx)
+            })));
+            items.push(Some((Icon::Copy, s.copy, shortcut("Ctrl+C", "⌘C"), false, |this, cx| {
+                this.copy_or_cut(Op::Copy, cx)
+            })));
+            items.push(Some((Icon::Paste, s.paste, shortcut("Ctrl+V", "⌘V"), false, |this, cx| this.paste(cx))));
             if single {
                 items.push(None);
                 items.push(Some((Icon::Pencil, s.rename, "F2", false, |this, cx| this.start_rename(cx))));
@@ -1052,14 +1541,23 @@ impl Explorer {
             items.push(Some((Icon::DeleteForever, s.delete, shift_del, true, |this, cx| this.ask_delete(cx))));
         } else {
             if !self.undo.is_empty() {
-                items.push(Some((Icon::Undo, s.undo, "Ctrl+Z", false, |this, cx| this.undo_last(cx))));
+                items
+                    .push(Some((Icon::Undo, s.undo, shortcut("Ctrl+Z", "⌘Z"), false, |this, cx| this.undo_last(cx))));
                 items.push(None);
             }
-            items.push(Some((Icon::Paste, s.paste, "Ctrl+V", false, |this, cx| this.paste(cx))));
-            items.push(Some((Icon::FolderPlus, s.new_folder, "Ctrl+Shift+N", false, |this, cx| this.new_folder(cx))));
+            items.push(Some((Icon::Paste, s.paste, shortcut("Ctrl+V", "⌘V"), false, |this, cx| this.paste(cx))));
+            items.push(Some((
+                Icon::FolderPlus,
+                s.new_folder,
+                shortcut("Ctrl+Shift+N", "⇧⌘N"),
+                false,
+                |this, cx| this.new_folder(cx),
+            )));
             items.push(None);
             items.push(Some((Icon::Refresh, s.refresh, "F5", false, |this, cx| this.reload(Vec::new(), cx))));
-            items.push(Some((Icon::SelectAll, s.select_all, "Ctrl+A", false, |this, cx| this.select_all(cx))));
+            items.push(Some((Icon::SelectAll, s.select_all, shortcut("Ctrl+A", "⌘A"), false, |this, cx| {
+                this.select_all(cx)
+            })));
         }
 
         let rows = items.into_iter().enumerate().map(|(i, item)| match item {
@@ -1152,17 +1650,12 @@ impl Explorer {
                     .shadow_lg()
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::Alert.el(18.).text_color(t.error))
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(SharedString::from(self.lang.confirm_delete(paths.len()))),
-                            ),
+                        div().flex().items_center().gap_2().child(Icon::Alert.el(18.).text_color(t.error)).child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(SharedString::from(self.lang.confirm_delete(paths.len()))),
+                        ),
                     )
                     .child(div().text_color(t.muted).truncate().child(SharedString::from(preview)))
                     .child(div().text_color(t.muted).child(s.confirm_body))
@@ -1216,10 +1709,14 @@ impl Explorer {
         let s = self.lang.t();
         let base = div().flex().items_center().gap_1p5().min_w_0().overflow_hidden();
         if let Some(&(_, job, n)) = self.busy.last() {
-            let text = match job {
+            let mut text = match job {
                 Job::Op(op) => self.lang.busy(op, n),
                 Job::Undo(_) => s.undoing.to_string(),
             };
+            let copied = self.progress.load(Ordering::Relaxed);
+            if copied > 0 {
+                text.push_str(&format!(" · {}", human_size(copied)));
+            }
             return base
                 .text_color(t.accent)
                 .child(Icon::Refresh.el(12.).text_color(t.accent))
@@ -1293,41 +1790,34 @@ impl Render for Explorer {
 
         let footer = div()
             .flex_none()
-            .h(px(28.))
+            .h(px(34.))
             .px_4()
             .flex()
             .items_center()
             .justify_between()
             .gap_4()
-            .border_t_1()
-            .border_color(t.border)
             .text_xs()
             .text_color(t.faint)
             .child(self.render_status(&t))
             .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(s.hints)
-                    .child(
-                        div()
-                            .id("lang")
-                            .px_1p5()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.muted)
-                            .bg(t.control)
-                            .hover(|d| d.bg(t.hover))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_lang(cx)))
-                            .child(Icon::Globe.el(11.).text_color(t.muted))
-                            .child(self.lang.code()),
-                    ),
+                div().min_w_0().flex().items_center().gap_3().child(div().min_w_0().truncate().child(s.hints)).child(
+                    div()
+                        .id("lang")
+                        .flex_none()
+                        .px_1p5()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.muted)
+                        .bg(t.control)
+                        .hover(|d| d.bg(t.hover))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_lang(cx)))
+                        .child(Icon::Globe.el(11.).text_color(t.muted))
+                        .child(self.lang.code()),
+                ),
             );
 
         let main = div()
@@ -1337,12 +1827,79 @@ impl Render for Explorer {
             .flex()
             .flex_col()
             .child(self.render_toolbar(&t, cx))
-            .child(self.render_column_header(&t))
-            .child(body)
+            .child(
+                div()
+                    .mx_3()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.bg)
+                    .overflow_hidden()
+                    .child(self.render_column_header(&t, cx))
+                    .child(body),
+            )
             .child(footer);
 
         let menu = self.menu.as_ref().map(|m| self.render_menu(m, &t, cx));
         let confirm = self.confirm.as_deref().map(|p| self.render_confirm(p, &t, cx));
+        let errors =
+            self.operation_errors.as_ref().map(|errors| {
+                div().absolute().inset_0().flex().items_center().justify_center().bg(t.scrim).child(
+                    div()
+                        .w(px(560.))
+                        .max_w(relative(0.9))
+                        .max_h(relative(0.8))
+                        .flex()
+                        .flex_col()
+                        .p_4()
+                        .gap_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.popover)
+                        .child(
+                            div().id("operation-errors").min_h_0().overflow_y_scroll().children(errors.iter().map(
+                                |error| div().py_1().text_color(t.error).child(SharedString::from(error.clone())),
+                            )),
+                        )
+                        .when(self.retry_paste.is_some(), |d| {
+                            d.child(
+                                div()
+                                    .id("retry-paste")
+                                    .cursor_pointer()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(t.selection)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.operation_errors = None;
+                                        if let Some(retry) = this.retry_paste.take() {
+                                            this.paste_paths(retry.sources, retry.destination, retry.operation, cx);
+                                        }
+                                    }))
+                                    .child(s.retry),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("dismiss-errors")
+                                .cursor_pointer()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(t.control)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.operation_errors = None;
+                                    cx.notify();
+                                }))
+                                .child("OK"),
+                        ),
+                )
+            });
 
         div()
             .key_context("Explorer")
@@ -1351,13 +1908,14 @@ impl Render for Explorer {
             .relative()
             .size_full()
             .flex()
-            .bg(t.bg)
+            .bg(t.frame)
             .text_color(t.text)
             .text_sm()
             .child(self.render_sidebar(&t, cx))
             .child(main)
             .children(menu)
             .children(confirm)
+            .children(errors)
     }
 }
 
@@ -1371,10 +1929,7 @@ fn file_tile(e: &Entry, t: &Theme) -> Div {
         Kind::Symlink { to_dir: false } => (Icon::Link, None),
         Kind::Other => (Icon::Unknown, None),
         Kind::File => {
-            let ext = Path::new(&e.name)
-                .extension()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
+            let ext = Path::new(&e.name).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
             t.file_style(&ext)
         }
     };
@@ -1383,24 +1938,18 @@ fn file_tile(e: &Entry, t: &Theme) -> Div {
         None => (t.tile_file, t.tile_file_fg),
     };
     div()
-        .size(px(26.))
+        .size(px(FILE_TILE_W))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .rounded_md()
         .bg(bg)
-        .child(icon.el(15.).text_color(fg))
+        .child(icon.el(13.).text_color(fg))
 }
 
 fn placeholder(text: String, color: gpui::Rgba) -> Div {
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(color)
-        .child(SharedString::from(text))
+    div().flex_1().flex().items_center().justify_center().text_color(color).child(SharedString::from(text))
 }
 
 fn human_size(b: u64) -> SharedString {
@@ -1418,7 +1967,7 @@ fn age(lang: Lang, t: SystemTime) -> SharedString {
     lang.age(SystemTime::now().duration_since(t).unwrap_or(Duration::ZERO).as_secs()).into()
 }
 
-fn start_dir(arg: Option<String>) -> PathBuf {
+fn start_dir(arg: Option<OsString>) -> PathBuf {
     arg.map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -1451,13 +2000,13 @@ fn main() {
     let mut forced_lang = None;
     let mut dir_arg = None;
     let mut bench_mode = false;
-    for a in std::env::args().skip(1) {
-        match a.as_str() {
+    for a in std::env::args_os().skip(1) {
+        match a.to_str().unwrap_or("") {
             "--bench" => bench_mode = true,
             "--exit-after-first-frame" => exit_after_first_frame = true,
             "--light" => forced_mode = Some(Mode::Light),
             "--dark" => forced_mode = Some(Mode::Dark),
-            _ if a.starts_with("--lang=") => forced_lang = Lang::parse(&a[7..]),
+            value if value.starts_with("--lang=") => forced_lang = Lang::parse(&value[7..]),
             _ => dir_arg = Some(a),
         }
     }
@@ -1489,6 +2038,10 @@ fn main() {
                         e.lang = l;
                     }
                     e
+                });
+                let closing_view = view.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    closing_view.upgrade().is_none_or(|view| view.read(cx).busy.is_empty())
                 });
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);

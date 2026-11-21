@@ -1,18 +1,31 @@
 [package]
 name = "fex"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2024"
-description = "POC: explorador de archivos para Linux con GPUI; objetivo < 200 ms al primer frame"
+description = "Explorador de archivos para Linux y macOS con GPUI"
 license = "MIT"
+
+[features]
+ui-tests = ["gpui/test-support", "gpui_platform/test-support"]
 
 [dependencies]
 # GPUI de Zed main (renderer wgpu en Linux). Fijado a un commit concreto: la API cambia a menudo.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false, features = ["wayland"] }
 futures = "0.3"
 notify = "8"
+libc = "0.2"
+tempfile = "3"
+xattr = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false, features = ["wayland"] }
 # Papelera freedesktop (~/.local/share/Trash y .Trash-$UID por punto de montaje)
 trash = { version = "5", default-features = false, features = ["freedesktop", "chrono"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 # Zed parchea estas crates en su workspace; sin los mismos parches gpui no compila fuera de él.
 [patch.crates-io]

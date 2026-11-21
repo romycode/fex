@@ -216,7 +216,15 @@ enum Unit {
 }
 
 pub struct Strings {
+    pub retry: &'static str,
     pub places: &'static str,
+    pub pins: &'static str,
+    pub pin_folder: &'static str,
+    pub unpin_folder: &'static str,
+    pub no_pins: &'static str,
+    pub pin_error: &'static str,
+    pub disks: &'static str,
+    pub no_disks: &'static str,
     pub home: &'static str,
     pub desktop: &'static str,
     pub documents: &'static str,
@@ -225,6 +233,7 @@ pub struct Strings {
     pub music: &'static str,
     pub videos: &'static str,
     pub system: &'static str,
+    pub go_up: &'static str,
     pub hidden: &'static str,
     pub theme_auto: &'static str,
     pub theme_light: &'static str,
@@ -262,7 +271,15 @@ pub struct Strings {
 }
 
 static ES: Strings = Strings {
-    places: "LUGARES",
+    retry: "Reintentar pendientes",
+    places: "Lugares",
+    pins: "Carpetas fijadas",
+    pin_folder: "Fijar carpeta actual",
+    unpin_folder: "Desfijar carpeta",
+    no_pins: "Sin carpetas fijadas",
+    pin_error: "No se pudieron guardar las carpetas fijadas",
+    disks: "Discos",
+    no_disks: "Sin discos adicionales",
     home: "Inicio",
     desktop: "Escritorio",
     documents: "Documentos",
@@ -271,10 +288,11 @@ static ES: Strings = Strings {
     music: "Música",
     videos: "Vídeos",
     system: "Sistema",
-    hidden: "Ocultos",
-    theme_auto: "Auto",
-    theme_light: "Claro",
-    theme_dark: "Oscuro",
+    go_up: "Subir a la carpeta superior",
+    hidden: "Archivos ocultos",
+    theme_auto: "Tema automático",
+    theme_light: "Tema claro",
+    theme_dark: "Tema oscuro",
     col_name: "Nombre",
     col_size: "Tamaño",
     col_modified: "Modificado",
@@ -282,7 +300,11 @@ static ES: Strings = Strings {
     empty: "Carpeta vacía",
     cannot_open: "No se puede abrir",
     items: "elementos",
-    hints: "⏎ abrir · ⌫ subir · F2 renombrar · Supr papelera · clic derecho: más",
+    hints: if cfg!(target_os = "macos") {
+        "⏎ abrir · ⌘⌫ papelera · F2 renombrar"
+    } else {
+        "⏎ abrir · ⌫ subir · F2 renombrar · Supr papelera · clic derecho: más"
+    },
     now: "Ahora",
     yesterday: "Ayer",
     open: "Abrir",
@@ -308,7 +330,15 @@ static ES: Strings = Strings {
 };
 
 static CA: Strings = Strings {
-    places: "LLOCS",
+    retry: "Torna a provar els pendents",
+    places: "Llocs",
+    pins: "Carpetes fixades",
+    pin_folder: "Fixa la carpeta actual",
+    unpin_folder: "Desfixa la carpeta",
+    no_pins: "Cap carpeta fixada",
+    pin_error: "No s'han pogut desar les carpetes fixades",
+    disks: "Discos",
+    no_disks: "Cap disc addicional",
     home: "Inici",
     desktop: "Escriptori",
     documents: "Documents",
@@ -317,10 +347,11 @@ static CA: Strings = Strings {
     music: "Música",
     videos: "Vídeos",
     system: "Sistema",
-    hidden: "Ocults",
-    theme_auto: "Auto",
-    theme_light: "Clar",
-    theme_dark: "Fosc",
+    go_up: "Puja a la carpeta superior",
+    hidden: "Fitxers ocults",
+    theme_auto: "Tema automàtic",
+    theme_light: "Tema clar",
+    theme_dark: "Tema fosc",
     col_name: "Nom",
     col_size: "Mida",
     col_modified: "Modificat",
@@ -328,7 +359,11 @@ static CA: Strings = Strings {
     empty: "Carpeta buida",
     cannot_open: "No es pot obrir",
     items: "elements",
-    hints: "⏎ obrir · ⌫ pujar · F2 reanomena · Supr paperera · clic dret: més",
+    hints: if cfg!(target_os = "macos") {
+        "⏎ obrir · ⌘⌫ paperera · F2 reanomena"
+    } else {
+        "⏎ obrir · ⌫ pujar · F2 reanomena · Supr paperera · clic dret: més"
+    },
     now: "Ara",
     yesterday: "Ahir",
     open: "Obre",
@@ -354,7 +389,15 @@ static CA: Strings = Strings {
 };
 
 static EN: Strings = Strings {
-    places: "PLACES",
+    retry: "Retry pending items",
+    places: "Places",
+    pins: "Pinned folders",
+    pin_folder: "Pin current folder",
+    unpin_folder: "Unpin folder",
+    no_pins: "No pinned folders",
+    pin_error: "Could not save pinned folders",
+    disks: "Drives",
+    no_disks: "No additional drives",
     home: "Home",
     desktop: "Desktop",
     documents: "Documents",
@@ -363,10 +406,11 @@ static EN: Strings = Strings {
     music: "Music",
     videos: "Videos",
     system: "System",
-    hidden: "Hidden",
-    theme_auto: "Auto",
-    theme_light: "Light",
-    theme_dark: "Dark",
+    go_up: "Go to parent folder",
+    hidden: "Hidden files",
+    theme_auto: "Automatic theme",
+    theme_light: "Light theme",
+    theme_dark: "Dark theme",
     col_name: "Name",
     col_size: "Size",
     col_modified: "Modified",
@@ -374,7 +418,11 @@ static EN: Strings = Strings {
     empty: "Empty folder",
     cannot_open: "Can't open",
     items: "items",
-    hints: "⏎ open · ⌫ up · F2 rename · Del trash · right-click: more",
+    hints: if cfg!(target_os = "macos") {
+        "⏎ open · ⌘⌫ trash · F2 rename"
+    } else {
+        "⏎ open · ⌫ up · F2 rename · Del trash · right-click: more"
+    },
     now: "Just now",
     yesterday: "Yesterday",
     open: "Open",

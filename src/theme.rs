@@ -43,7 +43,8 @@ impl Mode {
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub bg: Rgba,
-    pub sidebar: Rgba,
+    pub frame: Rgba,
+    pub path_bg: Rgba,
     pub border: Rgba,
     pub text: Rgba,
     pub muted: Rgba,
@@ -71,18 +72,19 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            bg: rgb(0x0f1115),
-            sidebar: rgb(0x14171c),
-            border: rgb(0x242830),
+            bg: rgb(0x171b24),
+            frame: rgb(0x10131b),
+            path_bg: rgb(0x1a1f2a),
+            border: rgb(0x2c3342),
             text: rgb(0xeceef1),
-            muted: rgb(0x9ba1aa),
-            faint: rgb(0x646b76),
-            accent: rgb(0x6e9bff),
-            selection: rgba(0x6e9bff33),
+            muted: rgb(0xa5adba),
+            faint: rgb(0x8993a5),
+            accent: rgb(0x85a6ff),
+            selection: rgba(0x789aff30),
             hover: rgba(0xffffff0f),
             control: rgba(0xffffff12),
             error: rgb(0xff7a8a),
-            popover: rgb(0x1b1e24),
+            popover: rgb(0x202634),
             danger_bg: rgb(0xc9303f),
             scrim: rgba(0x00000088),
             text_selection: rgba(0x6e9bff59),
@@ -99,11 +101,12 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             bg: rgb(0xffffff),
-            sidebar: rgb(0xf5f6f8),
-            border: rgb(0xe3e6eb),
+            frame: rgb(0xf1f4f9),
+            path_bg: rgb(0xffffff),
+            border: rgb(0xdde4ee),
             text: rgb(0x111318),
             muted: rgb(0x555c68),
-            faint: rgb(0x8f96a2),
+            faint: rgb(0x606d80),
             accent: rgb(0x2563eb),
             selection: rgba(0x2563eb1f),
             hover: rgba(0x0000000a),

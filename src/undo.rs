@@ -2,9 +2,9 @@
 //! La inversa nunca sobrescribe: si el sitio original está ocupado, falla con `Exists`.
 //! El borrado permanente no se puede deshacer (por eso pide confirmación).
 
-use std::{fs, io, path::PathBuf};
+use std::{ffi::OsString, fs, io, path::PathBuf};
 
-use crate::ops::{self, EXDEV, OpError, Report, exists, file_name};
+use crate::ops::{self, OpError, Report, Trashed, exists, file_name};
 
 pub const MAX_UNDO: usize = 50;
 
@@ -17,21 +17,38 @@ pub enum UndoKind {
     Trash,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Undo {
+    Guarded {
+        action: Box<Undo>,
+        snapshots: Vec<crate::safe_fs::Snapshot>,
+    },
     /// Deshacer copiar = mandar las copias a la papelera (recuperable, no se borran).
-    Copy { created: Vec<PathBuf> },
+    Copy {
+        created: Vec<PathBuf>,
+    },
     /// (original, actual)
-    Move { pairs: Vec<(PathBuf, PathBuf)> },
-    Rename { dir: PathBuf, from: String, to: String },
-    NewFolder { path: PathBuf },
-    /// `since`: segundos Unix al lanzar la operación, para identificar las entradas de la papelera.
-    Trash { paths: Vec<PathBuf>, since: i64 },
+    Move {
+        pairs: Vec<(PathBuf, PathBuf)>,
+    },
+    Rename {
+        dir: PathBuf,
+        from: OsString,
+        to: OsString,
+    },
+    NewFolder {
+        path: PathBuf,
+    },
+    /// Guarda la ubicación exacta de cada archivo en la papelera.
+    Trash {
+        paths: Vec<Trashed>,
+    },
 }
 
 impl Undo {
     pub fn kind(&self) -> UndoKind {
         match self {
+            Undo::Guarded { action, .. } => action.kind(),
             Undo::Copy { .. } => UndoKind::Copy,
             Undo::Move { .. } => UndoKind::Move,
             Undo::Rename { .. } => UndoKind::Rename,
@@ -40,11 +57,42 @@ impl Undo {
         }
     }
 
+    pub fn guard(self) -> io::Result<Self> {
+        let paths = match &self {
+            Undo::Copy { created } => created.clone(),
+            Undo::Move { pairs } => pairs.iter().map(|(_, path)| path.clone()).collect(),
+            Undo::Rename { dir, to, .. } => vec![dir.join(to)],
+            Undo::NewFolder { path } => vec![path.clone()],
+            Undo::Trash { .. } | Undo::Guarded { .. } => return Ok(self),
+        };
+        let snapshots =
+            paths.iter().map(|path| crate::safe_fs::Snapshot::capture(path)).collect::<io::Result<Vec<_>>>()?;
+        Ok(Undo::Guarded { action: Box::new(self), snapshots })
+    }
+
+    pub fn is_new_folder(&self, candidate: &std::path::Path) -> bool {
+        match self {
+            Undo::NewFolder { path } => path == candidate,
+            Undo::Guarded { action, .. } => action.is_new_folder(candidate),
+            _ => false,
+        }
+    }
+
     /// Ejecuta la inversa. Bloqueante: llamar desde background.
     /// `Report::created` lleva los nombres restaurados (para seleccionarlos).
     pub fn revert(self) -> Report {
         let mut r = Report::default();
         match self {
+            Undo::Guarded { action, snapshots } => {
+                for snapshot in snapshots {
+                    if let Err(error) = snapshot.verify() {
+                        r.errors.push(OpError::Io(file_name(&snapshot.path), error));
+                    }
+                }
+                if r.errors.is_empty() {
+                    return action.revert();
+                }
+            }
             Undo::Copy { created } => {
                 let present: Vec<PathBuf> = created.into_iter().filter(|p| exists(p)).collect();
                 r = ops::trash(&present);
@@ -57,15 +105,11 @@ impl Undo {
                         r.errors.push(OpError::Exists(name));
                         continue;
                     }
-                    let res = match fs::rename(&now, &orig) {
-                        Err(e) if e.raw_os_error() == Some(EXDEV) => {
-                            ops::copy_recursive(&now, &orig).and_then(|_| ops::remove_any(&now))
-                        }
-                        other => other,
-                    };
+                    let res = ops::move_exclusive(&now, &orig);
                     match res {
                         Ok(()) => {
-                            r.created.push(name);
+                            r.created_paths.push(orig.clone());
+                            r.created.push(orig.file_name().unwrap_or_default().to_os_string());
                             r.done += 1;
                         }
                         Err(e) => r.errors.push(OpError::Io(file_name(&now), e)),
@@ -74,14 +118,15 @@ impl Undo {
             }
             Undo::Rename { dir, from, to } => {
                 if exists(&dir.join(&from)) {
-                    r.errors.push(OpError::Exists(from));
+                    r.errors.push(OpError::Exists(from.to_string_lossy().into_owned()));
                 } else {
-                    match fs::rename(dir.join(&to), dir.join(&from)) {
+                    match crate::safe_fs::rename_exclusive(&dir.join(&to), &dir.join(&from)) {
                         Ok(()) => {
+                            r.created_paths.push(dir.join(&from));
                             r.created.push(from);
                             r.done = 1;
                         }
-                        Err(e) => r.errors.push(OpError::Io(to, e)),
+                        Err(e) => r.errors.push(OpError::Io(to.to_string_lossy().into_owned(), e)),
                     }
                 }
             }
@@ -94,46 +139,46 @@ impl Undo {
                 }
                 Err(e) => r.errors.push(OpError::Io(file_name(&path), e)),
             },
-            Undo::Trash { paths, since } => restore_from_trash(&paths, since, &mut r),
+            Undo::Trash { paths } => restore_from_trash(&paths, &mut r),
         }
         r
     }
 }
 
-fn restore_from_trash(paths: &[PathBuf], since: i64, r: &mut Report) {
-    let items = match trash::os_limited::list() {
-        Ok(items) => items,
-        Err(e) => {
-            r.errors.push(OpError::Trash(String::new(), e.to_string()));
-            return;
+#[cfg(target_os = "linux")]
+fn restore_from_trash(items: &[Trashed], report: &mut Report) {
+    for item in items {
+        let name = file_name(&item.original);
+        let result = item.snapshot.verify().and_then(|()| ops::move_exclusive(&item.location, &item.original));
+        match result {
+            Ok(()) => {
+                report.created_paths.push(item.original.clone());
+                report.created.push(item.original.file_name().unwrap_or_default().to_os_string());
+                report.done += 1;
+                if let Err(error) = fs::remove_file(&item.info) {
+                    report.errors.push(OpError::Io(name, error));
+                }
+            }
+            Err(error) => report.errors.push(OpError::Io(name, error)),
         }
-    };
-    for p in paths {
-        let name = file_name(p);
-        // La entrada más reciente con ese origen, borrada después de lanzar la operación.
-        // (DeletionDate tiene resolución de segundos y hora local: margen de 2 s.)
-        let item = items
-            .iter()
-            .filter(|i| {
-                Some(i.original_parent.as_path()) == p.parent()
-                    && i.name == *p.file_name().unwrap_or_default()
-                    && i.time_deleted >= since - 2
-            })
-            .max_by_key(|i| i.time_deleted);
-        let Some(item) = item else {
-            r.errors.push(OpError::Trash(name, "no está en la papelera".into()));
-            continue;
-        };
-        if exists(p) {
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_from_trash(items: &[Trashed], r: &mut Report) {
+    for item in items {
+        let name = file_name(&item.original);
+        if exists(&item.original) {
             r.errors.push(OpError::Exists(name));
             continue;
         }
-        match trash::os_limited::restore_all([item.clone()]) {
+        match crate::macos::restore_from_trash(item) {
             Ok(()) => {
-                r.created.push(name);
+                r.created_paths.push(item.original.clone());
+                r.created.push(item.original.file_name().unwrap_or_default().to_os_string());
                 r.done += 1;
             }
-            Err(e) => r.errors.push(OpError::Trash(name, e.to_string())),
+            Err(error) => r.errors.push(OpError::Trash(name, error)),
         }
     }
 }
@@ -174,10 +219,24 @@ mod tests {
     }
 
     #[test]
+    fn guarded_undo_refuses_modified_copies() {
+        let t = tmp("guarded");
+        let file = t.join("copy.txt");
+        fs::write(&file, "original").unwrap();
+        let undo = Undo::Copy { created: vec![file.clone()] }.guard().unwrap();
+        fs::write(&file, "new contents").unwrap();
+        let result = undo.revert();
+        assert_eq!(result.done, 0);
+        assert!(!result.errors.is_empty());
+        assert_eq!(fs::read_to_string(file).unwrap(), "new contents");
+        fs::remove_dir_all(t).unwrap();
+    }
+
+    #[test]
     fn undo_rename_and_new_folder() {
         let t = tmp("rename");
         fs::write(t.join("viejo.txt"), "").unwrap();
-        rename(&t, "viejo.txt", "nuevo.txt").unwrap();
+        rename(&t, std::ffi::OsStr::new("viejo.txt"), "nuevo.txt").unwrap();
         let r = Undo::Rename { dir: t.clone(), from: "viejo.txt".into(), to: "nuevo.txt".into() }.revert();
         assert_eq!(r.created, ["viejo.txt"]);
         assert!(t.join("viejo.txt").exists() && !t.join("nuevo.txt").exists());
@@ -189,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn undo_trash_restores_original() {
         // Papelera aislada: XDG_DATA_HOME apunta a un tmp (y el fichero vive en el mismo FS).
         let t = tmp("trash");
@@ -198,15 +258,11 @@ mod tests {
         unsafe { std::env::set_var("XDG_DATA_HOME", &data) };
         let f = t.join("borrame.txt");
         fs::write(&f, "importante").unwrap();
-        let since = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
         let rep = ops::trash(std::slice::from_ref(&f));
         assert!(rep.errors.is_empty(), "{:?}", rep.errors);
         assert!(!f.exists());
 
-        let r = Undo::Trash { paths: rep.trashed, since }.revert();
+        let r = Undo::Trash { paths: rep.trashed }.revert();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(fs::read_to_string(&f).unwrap(), "importante");
         fs::remove_dir_all(&t).unwrap();

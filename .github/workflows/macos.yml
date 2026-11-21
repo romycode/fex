@@ -1,0 +1,28 @@
+name: macOS Apple Silicon
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Test on arm64
+        run: cargo +1.98.1 test --locked --target aarch64-apple-darwin
+      - name: Package
+        run: |
+          rustup default 1.98.1
+          ./scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fex-macos-arm64
+          path: dist/Fex-macos-arm64.zip
