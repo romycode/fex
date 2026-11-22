@@ -40,8 +40,8 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Div, FocusHandle, FontFeatures,
     FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Role, ScrollStrategy, SharedString, Stateful,
-    Subscription, Task, Toggled, UniformListScrollHandle, Window, WindowBounds, WindowOptions, anchored, deferred, div,
-    prelude::*, px, relative, size, uniform_list, white,
+    Subscription, Task, Toggled, UniformListScrollHandle, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, anchored, deferred, div, prelude::*, px, relative, size, uniform_list, white,
 };
 use gpui_platform::application;
 
@@ -60,6 +60,8 @@ fn since_start_ms() -> f64 {
     T0.get().map(|t| t.elapsed()).unwrap_or_default().as_secs_f64() * 1e3
 }
 
+const WINDOW_RADIUS: f32 = 12.;
+const WINDOW_CONTENT_INSET: f32 = 4.;
 const ROW_H: f32 = 30.;
 const FILE_TILE_W: f32 = 20.;
 const SIDEBAR_W: f32 = 184.;
@@ -1612,7 +1614,13 @@ impl Explorer {
         .with_priority(1)
     }
 
-    fn render_confirm(&self, paths: &[PathBuf], t: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_confirm(
+        &self,
+        paths: &[PathBuf],
+        t: &Theme,
+        framed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let s = self.lang.t();
         let preview = paths
             .iter()
@@ -1626,6 +1634,7 @@ impl Explorer {
             .id("scrim")
             .absolute()
             .inset_0()
+            .when(framed, |d| d.inset(px(1.)).rounded(px(WINDOW_RADIUS - 1.)))
             .occlude()
             .bg(t.scrim)
             .flex()
@@ -1750,6 +1759,8 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+        let framed = !fullscreen && !(cfg!(target_os = "linux") && window.is_maximized());
         let t = self.mode.resolve(window.appearance());
         let s = self.lang.t();
 
@@ -1845,10 +1856,18 @@ impl Render for Explorer {
             .child(footer);
 
         let menu = self.menu.as_ref().map(|m| self.render_menu(m, &t, cx));
-        let confirm = self.confirm.as_deref().map(|p| self.render_confirm(p, &t, cx));
+        let confirm = self.confirm.as_deref().map(|p| self.render_confirm(p, &t, framed, cx));
         let errors =
             self.operation_errors.as_ref().map(|errors| {
-                div().absolute().inset_0().flex().items_center().justify_center().bg(t.scrim).child(
+                let scrim = div()
+                    .absolute()
+                    .inset_0()
+                    .when(framed, |d| d.inset(px(1.)).rounded(px(WINDOW_RADIUS - 1.)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(t.scrim);
+                scrim.child(
                     div()
                         .w(px(560.))
                         .max_w(relative(0.9))
@@ -1909,6 +1928,16 @@ impl Render for Explorer {
             .size_full()
             .flex()
             .bg(t.frame)
+            .when(framed, |d| {
+                // GPUI clips overflow to a rectangle. Inset the children so their
+                // corners stay inside the rounded border.
+                d.rounded(px(WINDOW_RADIUS))
+                    .border_1()
+                    .border_color(t.window_border)
+                    .p(px(WINDOW_CONTENT_INSET))
+                    .overflow_hidden()
+            })
+            .when(cfg!(target_os = "macos") && !fullscreen, |d| d.pt(px(32.)))
             .text_color(t.text)
             .text_sm()
             .child(self.render_sidebar(&t, cx))
@@ -2021,11 +2050,24 @@ fn main() {
     application().with_assets(Assets).run(move |cx: &mut App| {
         eprintln!("[fex] app lista: {:.1} ms", since_start_ms());
         let bounds = Bounds::centered(None, size(px(1000.), px(640.)), cx);
+        let options = WindowOptions {
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+        #[cfg(target_os = "macos")]
+        let options = {
+            let mut options = options;
+            if let Some(titlebar) = &mut options.titlebar {
+                // Let the frame reach the top edge while keeping the native controls.
+                titlebar.appears_transparent = true;
+            }
+            options
+        };
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("fex".into()),
-                ..Default::default()
+                ..options
             },
             move |window, cx| {
                 eprintln!("[fex] ventana creada: {:.1} ms", since_start_ms());
