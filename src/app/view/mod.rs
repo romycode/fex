@@ -1,6 +1,7 @@
 //! Render con GPUI. Aquí no hay lógica de negocio: solo se lee el estado de [`Explorer`]
 //! y se conectan clics a métodos o a comandos del registro.
 
+mod connection;
 mod list;
 mod overlays;
 mod sidebar;
@@ -160,6 +161,7 @@ impl Render for Explorer {
             Modal::ConfirmDelete(paths) => Some(self.render_confirm(paths, &t, cx).into_any_element()),
             Modal::Errors(errors) => Some(self.render_errors(errors, &t, cx).into_any_element()),
             Modal::Palette(_) => Some(self.render_palette(&t, cx).into_any_element()),
+            Modal::Connection(form) => Some(self.render_connection(form, &t, cx).into_any_element()),
             _ => None,
         };
 

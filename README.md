@@ -79,7 +79,38 @@ En macOS usa `⌘` en los atajos con `Ctrl` y para alternar la selección con cl
 
 ## Amazon S3
 
-En la barra lateral, **Amazon S3** pide un perfil de AWS (vacío = credenciales por defecto) y lista los buckets. Dentro de un bucket funcionan las mismas acciones que en local:
+### Conexiones
+
+La sección **Amazon S3** de la barra lateral lista las conexiones guardadas. `+` añade una y el lápiz la edita. Cada conexión elige sus credenciales:
+
+- **del sistema**: la cadena estándar de AWS (variables de entorno, `~/.aws/credentials`, SSO…), con un perfil opcional. Es la conexión `AWS` que existe por defecto.
+- **claves propias**: access key, secret key y, si hace falta, session token.
+
+Y, como opciones de cualquier conexión:
+
+- **host (endpoint)**: un servidor compatible con S3 (el emulador oficial de AWS, MinIO, R2…). Vacío = AWS.
+- **región**: si no se indica, la del perfil o `us-east-1`.
+- **rutas path-style** (`host/bucket/clave`): necesarias en casi todos los servidores compatibles y cuando el host es una IP.
+- **certificado CA**: un PEM adicional en el que confiar, para servidores con certificado propio.
+
+Se guardan en `~/.config/fex/s3` (Linux) o `~/Library/Application Support/fex/s3` (macOS), con permisos `0600` porque pueden llevar claves. También se puede editar a mano:
+
+```text
+[AWS]
+profile = default
+
+[Emulador]
+endpoint = https://127.0.0.1:9297
+region = us-east-1
+access_key = AKIA…
+secret_key = …
+path_style = true
+ca_file = ~/ruta/al/ca.pem
+```
+
+### Operaciones
+
+Dentro de un bucket funcionan las mismas acciones que en local:
 
 - **copiar, cortar y pegar** entre local y S3 en cualquier sentido, y entre buckets del mismo perfil (copia servidor a servidor, sin pasar por tu máquina). Las carpetas se copian enteras.
 - **renombrar, nueva carpeta y borrar.** S3 no tiene papelera: `Supr` pide confirmación y borra de forma permanente.
@@ -204,7 +235,7 @@ No incluye todavía:
 - rehacer (Ctrl+Shift+Z) y vista de la papelera
 - diálogo de conflictos: ahora siempre se renombra automáticamente
 - porcentaje total de las copias (ya se muestran bytes copiados y se pueden cancelar)
-- copiar entre perfiles de AWS distintos
+- copiar entre conexiones S3 distintas
 - el campo de renombrado no soporta IME ni selección con ratón
 - DnD
 - pestañas

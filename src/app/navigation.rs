@@ -15,7 +15,6 @@ use crate::{
     backend::Location,
     fs::{self, Entry, SortColumn},
     input::LineInput,
-    s3,
     watch::DirWatcher,
 };
 
@@ -215,11 +214,6 @@ impl Explorer {
         let Modal::Location(location) = std::mem::take(&mut self.modal) else { return };
         match location {
             LocationInput::Local(input) => self.navigate(self.resolve_local_path(&input.text), None, cx),
-            LocationInput::S3Profile(input) => {
-                let profile = input.text.trim();
-                let location = s3::Location::Buckets { profile: (!profile.is_empty()).then(|| profile.to_owned()) };
-                self.navigate_to(Location::S3(location), None, cx);
-            }
             LocationInput::DownloadDestination(input, request) => {
                 self.start_download(request, self.resolve_local_path(&input.text), cx);
             }
@@ -259,19 +253,6 @@ impl Explorer {
     }
 
     // ------------------------------------------------------------------ S3 ----
-
-    pub fn select_s3_profile(&mut self, cx: &mut Context<Self>) {
-        let profile = match &self.source {
-            Location::S3(location) => location.profile().map(str::to_owned),
-            Location::Local(_) => std::env::var("AWS_PROFILE").ok(),
-        }
-        .unwrap_or_default();
-        let mut input = LineInput::new(profile, 0);
-        input.select_all();
-        self.modal = Modal::Location(LocationInput::S3Profile(input));
-        self.menu = None;
-        cx.notify();
-    }
 
     pub fn download_selection(&mut self, cx: &mut Context<Self>) {
         if !self.can_start_job() || !self.caps().download {

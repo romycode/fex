@@ -42,7 +42,8 @@ const COPY_PART: u64 = 512 * 1024 * 1024;
 /// Un objeto o un "directorio" (prefijo terminado en `/`) de S3.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Object {
-    pub profile: Option<String>,
+    /// Nombre de la conexión S3 (credenciales y servidor).
+    pub connection: String,
     pub bucket: String,
     pub key: String,
 }
@@ -394,7 +395,10 @@ async fn rollback(client: &Client, created: &[Stored]) {
 pub async fn upload(sources: Vec<PathBuf>, dest: Object, op: Op, progress: Progress) -> Report {
     run(move |service| async move {
         let mut report = Report::default();
-        let client = service.bucket_client(&dest.profile, &dest.bucket).await;
+        let client = match service.bucket_client(&dest.connection, &dest.bucket).await {
+            Ok(client) => client,
+            Err(error) => return failed(&dest.uri(), error),
+        };
         let mut taken = match occupied(&client, &dest.bucket, &dest.key).await {
             Ok(names) => names,
             Err(error) => return failed(&dest.uri(), error),
@@ -499,7 +503,13 @@ pub async fn download(sources: Vec<Object>, dest: PathBuf, op: Op, progress: Pro
                 report.errors.push(OpError::Io(name, io::Error::new(io::ErrorKind::Interrupted, "cancelado")));
                 break;
             }
-            let client = service.bucket_client(&source.profile, &source.bucket).await;
+            let client = match service.bucket_client(&source.connection, &source.bucket).await {
+                Ok(client) => client,
+                Err(error) => {
+                    report.errors.push(OpError::Io(name, error));
+                    continue;
+                }
+            };
             match download_one(&client, &source, &dest, op, &progress).await {
                 Ok(path) => {
                     report.done += 1;
@@ -601,7 +611,10 @@ async fn fetch(client: &Client, bucket: &str, object: &Listed, path: &Path, prog
 pub async fn copy(sources: Vec<Object>, dest: Object, op: Op, label: &'static str, progress: Progress) -> Report {
     run(move |service| async move {
         let mut report = Report::default();
-        let client = service.bucket_client(&dest.profile, &dest.bucket).await;
+        let client = match service.bucket_client(&dest.connection, &dest.bucket).await {
+            Ok(client) => client,
+            Err(error) => return failed(&dest.uri(), error),
+        };
         let mut taken = match occupied(&client, &dest.bucket, &dest.key).await {
             Ok(names) => names,
             Err(error) => return failed(&dest.uri(), error),
@@ -612,8 +625,8 @@ pub async fn copy(sources: Vec<Object>, dest: Object, op: Op, label: &'static st
                 report.errors.push(OpError::Io(name, io::Error::new(io::ErrorKind::Interrupted, "cancelado")));
                 break;
             }
-            if source.profile != dest.profile {
-                report.errors.push(OpError::Io(name, io::Error::other("copiar entre perfiles de AWS no está soportado")));
+            if source.connection != dest.connection {
+                report.errors.push(OpError::Io(name, io::Error::other("copiar entre conexiones S3 distintas no está soportado")));
                 continue;
             }
             let same_place = source.bucket == dest.bucket && source.parent_prefix() == dest.key;
@@ -696,7 +709,10 @@ pub async fn rename(source: Object, new_name: String) -> Report {
         if !ops::validate_name(&new_name) {
             return failed(&name, io::Error::new(io::ErrorKind::InvalidInput, "nombre no válido"));
         }
-        let client = service.bucket_client(&source.profile, &source.bucket).await;
+        let client = match service.bucket_client(&source.connection, &source.bucket).await {
+            Ok(client) => client,
+            Err(error) => return failed(&name, error),
+        };
         let parent = source.parent_prefix().to_owned();
         match occupied(&client, &source.bucket, &parent).await {
             Ok(taken) if taken.contains(&new_name) => {
@@ -720,7 +736,10 @@ pub async fn rename(source: Object, new_name: String) -> Report {
 /// Crea una "carpeta" (marcador vacío `nombre/`) con un nombre libre.
 pub async fn mkdir(dest: Object, base: &'static str) -> Report {
     run(move |service| async move {
-        let client = service.bucket_client(&dest.profile, &dest.bucket).await;
+        let client = match service.bucket_client(&dest.connection, &dest.bucket).await {
+            Ok(client) => client,
+            Err(error) => return failed(base, error),
+        };
         let taken = match occupied(&client, &dest.bucket, &dest.key).await {
             Ok(names) => names,
             Err(error) => return failed(base, error),
@@ -750,7 +769,13 @@ pub async fn delete(sources: Vec<Object>, progress: Progress) -> Report {
                 report.errors.push(OpError::Io(name, io::Error::new(io::ErrorKind::Interrupted, "cancelado")));
                 break;
             }
-            let client = service.bucket_client(&source.profile, &source.bucket).await;
+            let client = match service.bucket_client(&source.connection, &source.bucket).await {
+                Ok(client) => client,
+                Err(error) => {
+                    report.errors.push(OpError::Io(name, error));
+                    continue;
+                }
+            };
             let result = async {
                 for object in list_tree(&client, &source).await? {
                     Progress::check(Some(&progress))?;
@@ -776,7 +801,13 @@ pub async fn revert(change: Change) -> Report {
         match change {
             Change::Created(created) => {
                 for stored in created.iter().rev() {
-                    let client = service.bucket_client(&stored.object.profile, &stored.object.bucket).await;
+                    let client = match service.bucket_client(&stored.object.connection, &stored.object.bucket).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            report.errors.push(OpError::Io(stored.object.name().to_owned(), error));
+                            continue;
+                        }
+                    };
                     match delete_object(&client, &stored.object.bucket, &stored.object.key, &stored.etag).await {
                         Ok(()) => report.done += 1,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -786,7 +817,13 @@ pub async fn revert(change: Change) -> Report {
             }
             Change::Moved(pairs) => {
                 for (original, now) in pairs.iter().rev() {
-                    let client = service.bucket_client(&original.profile, &original.bucket).await;
+                    let client = match service.bucket_client(&original.connection, &original.bucket).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            report.errors.push(OpError::Io(original.name().to_owned(), error));
+                            continue;
+                        }
+                    };
                     let listed = Listed { key: now.object.key.clone(), etag: now.etag.clone(), size: 0 };
                     let result = async {
                         copy_object(&client, &now.object.bucket, &listed, &original.bucket, &original.key, &Progress::default())
@@ -822,7 +859,7 @@ mod tests {
     use super::*;
 
     fn object(key: &str) -> Object {
-        Object { profile: None, bucket: "b".into(), key: key.into() }
+        Object { connection: super::super::TEST_CONNECTION.into(), bucket: "b".into(), key: key.into() }
     }
 
     impl Object {
@@ -884,7 +921,7 @@ mod tests {
         // ---- If-None-Match: una escritura directa sobre algo existente se rechaza
         let service = super::super::service().unwrap();
         let clash = service.runtime.block_on(async {
-            let client = service.bucket_client(&None, "bucket").await;
+            let client = service.bucket_client(super::super::TEST_CONNECTION, "bucket").await.unwrap();
             put_bytes(&client, "bucket", "in/a.txt", b"pisado".to_vec()).await
         });
         assert_eq!(clash.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
@@ -922,7 +959,7 @@ mod tests {
         let stale = fake.etag("bucket", "in/b.txt").unwrap();
         fake.put("bucket", "in/b.txt", b"cambiado por otro");
         let refused = service.runtime.block_on(async {
-            let client = service.bucket_client(&None, "bucket").await;
+            let client = service.bucket_client(super::super::TEST_CONNECTION, "bucket").await.unwrap();
             delete_object(&client, "bucket", "in/b.txt", &stale).await
         });
         assert!(refused.is_err());
@@ -980,7 +1017,7 @@ mod tests {
         assert!(fake.get("bucket", "in/a (2).txt").is_none());
         assert!(backend::paste_undo(&r, Op::Move).is_none(), "mover entre backends no se deshace");
         let s3_dest = Location::S3(super::super::Location::Prefix {
-            profile: None,
+            connection: super::super::TEST_CONNECTION.into(),
             bucket: "other".into(),
             prefix: String::new(),
         });

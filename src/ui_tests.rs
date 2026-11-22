@@ -240,6 +240,14 @@ fn commands_drive_keyboard_palette_and_menus() {
     screenshot(&mut app, handle, "rename");
     app.update_window(handle.into(), |_, window, cx| key(window, cx, "escape")).unwrap();
 
+    // Borrado permanente: el diálogo de confirmación se pinta (y Esc lo cierra sin borrar).
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "shift-delete")).unwrap();
+    handle.update(&mut app, |e, _, _| assert!(matches!(e.modal, Modal::ConfirmDelete(_)))).unwrap();
+    screenshot(&mut app, handle, "confirm-delete");
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "escape")).unwrap();
+    handle.update(&mut app, |e, _, _| assert!(matches!(e.modal, Modal::None))).unwrap();
+    assert!(root.join("New Folder").is_dir(), "Esc no borra");
+
     // Deshacer desde el teclado.
     app.update_window(handle.into(), |_, window, cx| key(window, cx, "ctrl-z")).unwrap();
     wait_for_jobs(&mut app, handle);
@@ -259,7 +267,7 @@ fn commands_drive_keyboard_palette_and_menus() {
 }
 
 #[test]
-fn user_keymap_overrides_defaults_end_to_end() {
+fn user_config_keymap_and_s3_connections_end_to_end() {
     let config = tempfile::tempdir().unwrap();
     std::fs::write(
         config.path().join(crate::app::bindings::FILE_NAME),
@@ -293,4 +301,73 @@ fn user_keymap_overrides_defaults_end_to_end() {
         assert!(matches!(e.modal, Modal::Rename(_)));
     }).unwrap();
     assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1, "`n` crea la carpeta");
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "escape")).unwrap();
+
+    // ---- conexiones S3: sin fichero hay una con las credenciales del sistema
+    handle.update(&mut app, |e, _, _| {
+        assert_eq!(e.s3_connections.len(), 1);
+        assert_eq!(e.s3_connections[0].name, crate::s3::connection::DEFAULT_NAME);
+    }).unwrap();
+
+    // Añadir una con host, claves y CA desde el teclado.
+    let type_text = |app: &mut HeadlessAppContext, text: &str| {
+        handle.update(app, |e, _, cx| {
+            let Modal::Connection(form) = &mut e.modal else { panic!("el formulario debería estar abierto") };
+            form.select_all();
+            form.insert(text);
+            cx.notify();
+        }).unwrap();
+    };
+    let tab = |app: &mut HeadlessAppContext| app.update_window(handle.into(), |_, window, cx| key(window, cx, "tab")).unwrap();
+    handle.update(&mut app, |e, _, cx| crate::app::commands::run(e, crate::app::commands::find("s3.add"), cx)).unwrap();
+    type_text(&mut app, "Emulador");
+    tab(&mut app);
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "space")).unwrap();
+    tab(&mut app);
+    type_text(&mut app, "AKIAEMULATOR");
+    tab(&mut app);
+    type_text(&mut app, "secreto");
+    tab(&mut app);
+    tab(&mut app);
+    type_text(&mut app, "127.0.0.1:9297");
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "enter")).unwrap();
+    handle.update(&mut app, |e, _, _| {
+        let Modal::Connection(form) = &e.modal else { panic!("un host sin esquema no se guarda") };
+        assert!(form.error.is_some());
+    }).unwrap();
+    type_text(&mut app, "https://127.0.0.1:9297");
+    handle.update(&mut app, |e, _, cx| {
+        let Modal::Connection(form) = &mut e.modal else { unreachable!() };
+        form.toggle(crate::app::connection_form::Row::PathStyle);
+        form.focus_row(crate::app::connection_form::Row::Text(crate::app::connection_form::Field::CaFile));
+        cx.notify();
+    }).unwrap();
+    type_text(&mut app, "/tmp/ca.pem");
+    screenshot(&mut app, handle, "s3-connection");
+    app.update_window(handle.into(), |_, window, cx| key(window, cx, "enter")).unwrap();
+    app.run_until_parked();
+    handle.update(&mut app, |e, _, _| {
+        assert!(matches!(e.modal, Modal::None));
+        assert_eq!(e.s3_connections.len(), 2);
+        // Guardar una conexión nueva la abre.
+        assert!(matches!(&e.source, crate::backend::Location::S3(l) if l.connection() == "Emulador"));
+    }).unwrap();
+    screenshot(&mut app, handle, "s3-sidebar");
+    let file = config.path().join(crate::s3::connection::FILE_NAME);
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.contains("[Emulador]") && saved.contains("endpoint = https://127.0.0.1:9297"), "{saved}");
+    assert!(saved.contains("access_key = AKIAEMULATOR") && saved.contains("path_style = true"), "{saved}");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // Editar y eliminar: vuelve a local.
+    handle.update(&mut app, |e, _, cx| {
+        e.edit_current_connection(cx);
+        e.delete_connection(cx);
+    }).unwrap();
+    app.run_until_parked();
+    handle.update(&mut app, |e, _, _| {
+        assert_eq!(e.s3_connections.len(), 1);
+        assert!(e.source.is_local());
+    }).unwrap();
 }

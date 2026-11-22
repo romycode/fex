@@ -16,7 +16,7 @@ app/               aplicación (GPUI)
   jobs.rs          trabajos en segundo plano, avisos, deshacer
   view/            solo render: sidebar, toolbar, list, overlays, status
 keymap.rs          atajos como datos ("mod-shift-n") y diferencias Linux/macOS
-config.rs          directorio de configuración por plataforma
+config.rs          directorio de configuración por plataforma (keymap, pins, conexiones S3)
 backend.rs         Location, Item, Capabilities y operaciones comunes  ← extensión de backends
 fs.rs ops.rs safe_fs.rs undo.rs watch.rs sidebar.rs s3/ (listar y escribir; fake.rs para tests)
                    dominio puro, sin GPUI, con tests propios

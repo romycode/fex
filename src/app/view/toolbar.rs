@@ -56,7 +56,6 @@ impl Explorer {
         if let Modal::Location(location) = &self.modal {
             let (input, placeholder) = match location {
                 LocationInput::Local(input) => (input, None),
-                LocationInput::S3Profile(input) => (input, Some(self.lang.t().aws_profile)),
                 LocationInput::DownloadDestination(input, _) => (input, Some(self.lang.t().download_destination)),
             };
             let (before, selected, after) = input.parts();

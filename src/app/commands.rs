@@ -119,7 +119,11 @@ pub static COMMANDS: &[Command] = &[
         "h",
     ]),
     cmd("nav.location", |s| s.go_to, |e, cx| e.edit_location(cx)).icon(Icon::Folder).keys(&["mod-l"]).when(|e| e.source.is_local()),
-    cmd("nav.s3", |s| s.s3_browse, |e, cx| e.select_s3_profile(cx)).icon(Icon::Globe).keys(&["mod-l"]),
+    cmd("nav.s3", |s| s.s3_browse, |e, cx| e.browse_s3(cx)).icon(Icon::Globe),
+    cmd("s3.add", |s| s.s3_add, |e, cx| e.add_connection(cx)).icon(Icon::Plus),
+    cmd("s3.edit", |s| s.s3_edit, |e, cx| e.edit_current_connection(cx))
+        .icon(Icon::Pencil)
+        .when(|e| !e.source.is_local()),
     cmd("view.refresh", |s| s.refresh, |e, cx| e.reload(Vec::new(), cx)).icon(Icon::Refresh).keys(&["f5", "mod-r"]),
     cmd("view.hidden", |s| s.hidden, |e, cx| e.toggle_hidden(cx))
         .icon(Icon::Eye)

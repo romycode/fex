@@ -10,9 +10,11 @@
 
 pub mod bindings;
 pub mod commands;
+pub mod connection_form;
 mod file_ops;
 mod jobs;
 mod navigation;
+mod s3_connections;
 pub mod selection;
 mod view;
 
@@ -51,14 +53,13 @@ pub struct Clip {
 
 pub enum LocationInput {
     Local(LineInput),
-    S3Profile(LineInput),
     DownloadDestination(LineInput, DownloadRequest),
 }
 
 impl LocationInput {
     fn input(&mut self) -> &mut LineInput {
         match self {
-            Self::Local(input) | Self::S3Profile(input) | Self::DownloadDestination(input, _) => input,
+            Self::Local(input) | Self::DownloadDestination(input, _) => input,
         }
     }
 }
@@ -90,6 +91,8 @@ pub enum Modal {
     Location(LocationInput),
     Palette(Palette),
     ConfirmDelete(Vec<Item>),
+    /// Añadir o editar una conexión S3.
+    Connection(connection_form::ConnectionForm),
     Errors(Vec<String>),
 }
 
@@ -134,6 +137,8 @@ pub struct Explorer {
 
     // ------------------------------------------------------------ resto
     pub places: Places,
+    /// Conexiones S3 guardadas (barra lateral). La primera es la de "Explorar Amazon S3".
+    pub s3_connections: Vec<crate::s3::connection::Connection>,
     pub jobs: Jobs,
     pub mode: Mode,
     pub lang: Lang,
@@ -224,6 +229,7 @@ impl Explorer {
             clip: None,
             pending_rename: None,
             places: Places { fixed: fs::places(), pins: None, disks: Vec::new(), pin_busy: false },
+            s3_connections: Vec::new(),
             jobs: Jobs::default(),
             mode: Mode::System,
             lang: Lang::detect(),
@@ -241,6 +247,7 @@ impl Explorer {
         };
         this.navigate(cwd, None, cx);
         this.load_keymap(false, cx);
+        this.load_s3_connections(cx);
         this
     }
 
@@ -534,6 +541,23 @@ impl Explorer {
                     "enter" => self.confirm_delete(cx),
                     "escape" => self.modal = Modal::None,
                     _ => {}
+                }
+                cx.notify();
+                return;
+            }
+            Modal::Connection(form) => {
+                match (command, key) {
+                    (true, "v") => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            form.insert(&text);
+                        }
+                    }
+                    (true, "a") => form.select_all(),
+                    _ => match form.key(key, m.shift, ch, command || m.control) {
+                        connection_form::Outcome::Save => self.save_connection(cx),
+                        connection_form::Outcome::Cancel => self.modal = Modal::None,
+                        connection_form::Outcome::Continue => {}
+                    },
                 }
                 cx.notify();
                 return;

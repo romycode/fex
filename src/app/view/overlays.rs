@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Fondo oscurecido a pantalla completa. Un clic fuera del contenido cierra el modal.
-fn scrim(id: &'static str, t: &Theme, cx: &Context<Explorer>) -> Stateful<Div> {
+pub(super) fn scrim(id: &'static str, t: &Theme, cx: &Context<Explorer>) -> Stateful<Div> {
     div()
         .id(id)
         .absolute()
@@ -31,7 +31,7 @@ fn scrim(id: &'static str, t: &Theme, cx: &Context<Explorer>) -> Stateful<Div> {
         }))
 }
 
-fn dialog(id: &'static str, t: &Theme) -> Stateful<Div> {
+pub(super) fn dialog(id: &'static str, t: &Theme) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -44,18 +44,20 @@ fn dialog(id: &'static str, t: &Theme) -> Stateful<Div> {
         .on_click(|_, _, cx| cx.stop_propagation())
 }
 
-fn button(id: &'static str, label: &'static str, t: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h(px(32.))
-        .px_3()
-        .flex()
-        .items_center()
-        .rounded_md()
-        .cursor_pointer()
-        .bg(t.control)
-        .hover(|d| d.bg(t.hover))
-        .child(label)
+/// Botón secundario (fondo neutro).
+pub(super) fn button(id: &'static str, label: &'static str, t: &Theme) -> Stateful<Div> {
+    let hover = t.hover;
+    button_base(id, label).bg(t.control).hover(move |d| d.bg(hover))
+}
+
+/// Botón principal o destructivo: fondo de color, texto blanco.
+/// GPUI solo admite un `hover` por elemento, por eso no se construye sobre [`button`].
+pub(super) fn filled_button(id: &'static str, label: &'static str, color: gpui::Rgba) -> Stateful<Div> {
+    button_base(id, label).bg(color).text_color(white()).font_weight(FontWeight::SEMIBOLD).hover(|d| d.opacity(0.9))
+}
+
+fn button_base(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div().id(id).h(px(32.)).px_3().flex().items_center().rounded_md().cursor_pointer().child(label)
 }
 
 impl Explorer {
@@ -154,11 +156,7 @@ impl Explorer {
                             cx.notify();
                         })))
                         .child(
-                            button("do-delete", s.delete, t)
-                                .bg(t.danger_bg)
-                                .text_color(white())
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .hover(|d| d.opacity(0.9))
+                            filled_button("do-delete", s.delete, t.danger_bg)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.confirm_delete(cx);
                                     cx.notify();
@@ -191,8 +189,9 @@ impl Explorer {
                         .gap_2()
                         .when(self.jobs.retry_paste.is_some(), |d| {
                             d.child(
-                                button("retry-paste", s.retry, t)
+                                button_base("retry-paste", s.retry)
                                     .bg(t.selection)
+                                    .hover(|d| d.opacity(0.9))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.retry_failed_paste(cx))),
                             )
                         })
