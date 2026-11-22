@@ -46,8 +46,10 @@ fn navigation_sort_and_location_use_real_ui_entry_points() {
     }).unwrap();
     app.update_window(handle.into(), |_, window, cx| key(window, cx, "ctrl-l")).unwrap();
     handle.update(&mut app, |explorer, _, _| {
-        assert!(explorer.location.is_some());
-        explorer.location.as_mut().unwrap().insert(second.to_str().unwrap());
+        let Some(LocationInput::Local(input)) = explorer.location.as_mut() else {
+            panic!("Ctrl+L should open the local location input");
+        };
+        input.insert(second.to_str().unwrap());
     }).unwrap();
     app.update_window(handle.into(), |_, window, cx| {
         let _ = window.draw(cx);
