@@ -7,6 +7,7 @@
 //! - El watcher se crea tras el primer listado.
 //! - Nada de gvfs, temas de iconos ni miniaturas.
 
+mod backend;
 mod fs;
 mod i18n;
 mod icons;
@@ -14,6 +15,7 @@ mod input;
 #[cfg(target_os = "macos")]
 mod macos;
 mod ops;
+mod s3;
 mod safe_fs;
 mod sidebar;
 mod theme;
@@ -26,6 +28,7 @@ mod ui_tests;
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
+    future::Future,
     io,
     ops::Range,
     path::{Path, PathBuf},
@@ -39,12 +42,13 @@ use std::{
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, Div, FocusHandle, FontFeatures,
-    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Role, ScrollStrategy, SharedString, Stateful,
-    Subscription, Task, Toggled, UniformListScrollHandle, Window, WindowBounds, WindowOptions, anchored, deferred, div,
-    prelude::*, px, relative, size, uniform_list, white,
+    FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, Role, ScrollStrategy,
+    SharedString, Stateful, Subscription, Task, Toggled, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    anchored, deferred, div, prelude::*, px, relative, size, uniform_list, white,
 };
 use gpui_platform::application;
 
+use backend::Location;
 use fs::{Entry, Kind, Place, SortColumn};
 use i18n::Lang;
 use icons::{Assets, Icon};
@@ -80,6 +84,17 @@ struct Clip {
     set: HashSet<PathBuf>,
     op: Op,
     text: String,
+}
+
+enum LocationInput {
+    Local(LineInput),
+    S3Profile(LineInput),
+    DownloadDestination(LineInput, DownloadRequest),
+}
+
+struct DownloadRequest {
+    source: Location,
+    keys: Vec<String>,
 }
 
 struct Rename {
@@ -126,11 +141,13 @@ impl Render for ToolbarTooltip {
 enum Job {
     Op(Op),
     Undo(UndoKind),
+    Download,
 }
 
 enum Notice {
     Done(Op, usize),
     Undone(UndoKind),
+    Downloaded(usize),
     /// Informativo (gris): "Nada que deshacer".
     Info(&'static str),
     Error(String),
@@ -139,6 +156,8 @@ enum Notice {
 type Action = fn(&mut Explorer, &mut Context<Explorer>);
 
 struct Explorer {
+    source: Location,
+    // Last local directory, retained when browsing another backend.
     cwd: PathBuf,
     home: Option<PathBuf>,
     places: Vec<Place>,
@@ -162,7 +181,7 @@ struct Explorer {
 
     clip: Option<Clip>,
     renaming: Option<Rename>,
-    location: Option<LineInput>,
+    location: Option<LocationInput>,
     sort_column: SortColumn,
     sort_descending: bool,
     pending_rename: Option<OsString>,
@@ -184,6 +203,7 @@ struct Explorer {
     _list_task: Option<Task<()>>,
     _stat_task: Option<Task<()>>,
     _notice_task: Option<Task<()>>,
+    download_prompt: Option<Task<()>>,
     _watch_task: Task<()>,
     _sidebar_task: Task<()>,
     _appearance: Subscription,
@@ -202,7 +222,7 @@ impl Explorer {
                 while watch_rx.try_recv().is_ok() {}
                 let updated = this.update(cx, |this, cx| {
                     // Hasta que termine la navegación, el watcher sigue en la ruta anterior.
-                    if !this.loading {
+                    if this.source.is_local() && !this.loading {
                         this.reload(Vec::new(), cx);
                     }
                 });
@@ -243,6 +263,7 @@ impl Explorer {
         });
 
         let mut this = Self {
+            source: Location::Local(PathBuf::new()),
             cwd: PathBuf::new(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             places: fs::places(),
@@ -282,6 +303,7 @@ impl Explorer {
             _list_task: None,
             _stat_task: None,
             _notice_task: None,
+            download_prompt: None,
             _watch_task: watch_task,
             _sidebar_task: sidebar_task,
             _appearance: appearance,
@@ -293,7 +315,11 @@ impl Explorer {
     // ------------------------------------------------------ navegación ----
 
     fn navigate(&mut self, dir: PathBuf, select: Option<OsString>, cx: &mut Context<Self>) {
-        let refresh = dir == self.cwd;
+        self.navigate_to(Location::Local(dir), select, cx);
+    }
+
+    fn navigate_to(&mut self, location: Location, select: Option<OsString>, cx: &mut Context<Self>) {
+        let refresh = location == self.source;
         if !refresh {
             // Las filas y las acciones pendientes pertenecen al directorio anterior.
             self.entries.clear();
@@ -306,19 +332,25 @@ impl Explorer {
             self.confirm = None;
         }
         self.menu = None;
-        self.load(dir, refresh, select.into_iter().collect(), cx);
+        self.location = None;
+        self.load(location, refresh, select.into_iter().collect(), cx);
     }
 
     /// Relee el directorio actual sin perder selección ni scroll.
     /// `select` no vacío → esos nombres quedan seleccionados (tras pegar, renombrar…).
     fn reload(&mut self, select: Vec<OsString>, cx: &mut Context<Self>) {
-        self.load(self.cwd.clone(), true, select, cx);
+        self.load(self.source.clone(), true, select, cx);
     }
 
-    fn load(&mut self, dir: PathBuf, refresh: bool, select: Vec<OsString>, cx: &mut Context<Self>) {
+    fn load(&mut self, location: Location, refresh: bool, select: Vec<OsString>, cx: &mut Context<Self>) {
         self.generation += 1;
         let generation = self.generation;
-        self.cwd = dir.clone();
+        if let Location::Local(dir) = &location {
+            self.cwd = dir.clone();
+        } else {
+            self.watcher = None;
+        }
+        self.source = location.clone();
         if !refresh {
             self.loading = true;
             self.error = None;
@@ -328,7 +360,7 @@ impl Explorer {
 
         let show_hidden = self.show_hidden;
         let started = Instant::now();
-        let listing = cx.background_spawn(async move { fs::list_dir(&dir, show_hidden) });
+        let listing = cx.background_spawn(async move { location.list(show_hidden).await });
 
         self._list_task = Some(cx.spawn(async move |this, cx| {
             let result = listing.await;
@@ -340,7 +372,7 @@ impl Explorer {
                 this.loading = false;
                 match result {
                     Ok(entries) => this.apply_listing(entries, refresh, select, took, generation, cx),
-                    Err(e) if refresh && e.kind() == io::ErrorKind::NotFound => {
+                    Err(e) if this.source.is_local() && refresh && e.kind() == io::ErrorKind::NotFound => {
                         // Han borrado el directorio actual: subir al primer ancestro que exista.
                         let up = this.cwd.ancestors().skip(1).find(|p| p.is_dir()).map(Path::to_path_buf);
                         if let Some(up) = up {
@@ -415,8 +447,10 @@ impl Explorer {
         }
 
         self.status_count = Some((self.entries.len(), took.as_secs_f64() * 1e3));
-        self.watch_cwd();
-        self.start_stat_pass(generation, cx);
+        if self.source.is_local() {
+            self.watch_cwd();
+            self.start_stat_pass(generation, cx);
+        }
     }
 
     fn watch_cwd(&mut self) {
@@ -475,30 +509,43 @@ impl Explorer {
     fn edit_location(&mut self, cx: &mut Context<Self>) {
         let mut input = LineInput::new(self.cwd.to_string_lossy().into_owned(), 0);
         input.select_all();
-        self.location = Some(input);
+        self.location = Some(LocationInput::Local(input));
         self.renaming = None;
         self.menu = None;
         cx.notify();
     }
 
     fn commit_location(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.location.take() else { return };
-        let path = if input.text == "~" {
+        match self.location.take() {
+            Some(LocationInput::Local(input)) => self.navigate(self.resolve_local_path(&input.text), None, cx),
+            Some(LocationInput::S3Profile(input)) => {
+                let profile = input.text.trim();
+                let location = s3::Location::Buckets { profile: (!profile.is_empty()).then(|| profile.to_owned()) };
+                self.navigate_to(Location::S3(location), None, cx);
+            }
+            Some(LocationInput::DownloadDestination(input, request)) => {
+                self.start_download(request, self.resolve_local_path(&input.text), cx);
+            }
+            None => {}
+        }
+    }
+
+    fn resolve_local_path(&self, input: &str) -> PathBuf {
+        if input == "~" {
             self.home.clone().unwrap_or_else(|| self.cwd.clone())
-        } else if let Some(suffix) = input.text.strip_prefix("~/") {
+        } else if let Some(suffix) = input.strip_prefix("~/") {
             self.home.as_ref().unwrap_or(&self.cwd).join(suffix)
         } else {
-            self.cwd.join(&input.text)
-        };
-        self.navigate(path, None, cx);
+            self.cwd.join(input)
+        }
     }
 
     fn open_cursor(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.get(self.cursor) else { return };
-        let path = self.cwd.join(&entry.name);
-        if entry.kind.is_dir() {
-            self.navigate(path, None, cx);
-        } else {
+        if let Some(location) = self.source.child(entry) {
+            self.navigate_to(location, None, cx);
+        } else if self.source.is_local() {
+            let path = self.cwd.join(&entry.name);
             // En un hilo aparte para recoger el proceso (sin zombis) y no bloquear.
             std::thread::spawn(move || {
                 let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
@@ -508,9 +555,78 @@ impl Explorer {
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
-        let Some(parent) = self.cwd.parent().map(Path::to_path_buf) else { return };
-        let came_from = self.cwd.file_name().map(OsStr::to_os_string);
-        self.navigate(parent, came_from, cx);
+        if let Some((parent, child)) = self.source.parent() {
+            self.navigate_to(parent, Some(child), cx);
+        } else if !self.source.is_local() {
+            self.navigate(self.cwd.clone(), None, cx);
+        }
+    }
+
+    fn select_s3_profile(&mut self, cx: &mut Context<Self>) {
+        let profile = match &self.source {
+            Location::S3(location) => location.profile().map(str::to_owned),
+            Location::Local(_) => std::env::var("AWS_PROFILE").ok(),
+        }
+        .unwrap_or_default();
+        let mut input = LineInput::new(profile, 0);
+        input.select_all();
+        self.location = Some(LocationInput::S3Profile(input));
+        self.menu = None;
+        self.renaming = None;
+        self.confirm = None;
+        cx.notify();
+    }
+
+    fn download_keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            if self.is_selected(i, &entry.name) { self.source.download_key(entry) } else { None }
+        })
+    }
+
+    fn download_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.can_start_job() {
+            return;
+        }
+        let keys = self.download_keys().map(str::to_owned).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
+        }
+        let request = DownloadRequest { source: self.source.clone(), keys };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.lang.t().download_destination.into()),
+        });
+        self.menu = None;
+        self.download_prompt = Some(cx.spawn(async move |this, cx| {
+            let response = receiver.await;
+            this.update(cx, |this, cx| {
+                this.download_prompt = None;
+                match response {
+                    Ok(Ok(None)) => {}
+                    Ok(Ok(Some(mut paths))) if !paths.is_empty() => {
+                        this.start_download(request, paths.pop().unwrap(), cx);
+                    }
+                    _ => {
+                        let mut input = LineInput::new(this.cwd.to_string_lossy().into_owned(), 0);
+                        input.select_all();
+                        this.location = Some(LocationInput::DownloadDestination(input, request));
+                        this.renaming = None;
+                        this.confirm = None;
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn start_download(&mut self, request: DownloadRequest, directory: PathBuf, cx: &mut Context<Self>) {
+        let progress = self.progress.clone();
+        let DownloadRequest { source, keys } = request;
+        self.run_job(Job::Download, keys.len(), source.download(keys, directory, progress), |_| None, cx);
     }
 
     fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
@@ -571,6 +687,9 @@ impl Explorer {
     }
 
     fn target_paths(&self) -> Vec<PathBuf> {
+        if !self.source.is_local() {
+            return Vec::new();
+        }
         self.target_names().into_iter().map(|n| self.cwd.join(n)).collect()
     }
 
@@ -688,17 +807,23 @@ impl Explorer {
         }
     }
 
+    fn can_start_job(&self) -> bool {
+        self.busy.is_empty()
+            && self.download_prompt.is_none()
+            && !matches!(self.location, Some(LocationInput::DownloadDestination(..)))
+    }
+
     /// Lanza un trabajo en background; al terminar avisa, apila su deshacer (si lo tiene)
     /// y refresca seleccionando el resultado.
     fn run_job(
         &mut self,
         job: Job,
         n: usize,
-        work: impl FnOnce() -> ops::Report + Send + 'static,
+        work: impl Future<Output = ops::Report> + Send + 'static,
         make_undo: impl FnOnce(&ops::Report) -> Option<Undo> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         let cwd = self.cwd.clone();
@@ -725,7 +850,7 @@ impl Explorer {
         cx.notify();
 
         let task = cx.background_spawn(async move {
-            let mut report = work();
+            let mut report = work.await;
             let undo = match make_undo(&report).map(Undo::guard) {
                 Some(Ok(undo)) => Some(undo),
                 Some(Err(error)) => {
@@ -748,6 +873,7 @@ impl Explorer {
                     let mut details = vec![match job {
                         Job::Op(op) => this.lang.done(op, report.done),
                         Job::Undo(_) => this.lang.t().undo.into(),
+                        Job::Download => format!("{} {}", report.done, this.lang.t().downloaded),
                     }];
                     details.extend(report.errors.iter().map(|error| this.describe_errors(std::slice::from_ref(error))));
                     this.operation_errors = Some(details);
@@ -756,6 +882,7 @@ impl Explorer {
                     (false, _) => Notice::Error(this.describe_errors(&report.errors)),
                     (true, Job::Op(op)) => Notice::Done(op, report.done),
                     (true, Job::Undo(k)) => Notice::Undone(k),
+                    (true, Job::Download) => Notice::Downloaded(report.done),
                 };
                 this.set_notice(notice, cx);
                 let selected = report
@@ -764,7 +891,9 @@ impl Explorer {
                     .filter(|path| path.parent() == Some(this.cwd.as_path()))
                     .filter_map(|path| path.file_name().map(OsStr::to_os_string))
                     .collect::<Vec<_>>();
-                if this.cwd == cwd || !selected.is_empty() {
+                if this.source.is_local()
+                    && (!selected.is_empty() || (!matches!(job, Job::Download) && this.cwd == cwd))
+                {
                     this.reload(selected, cx);
                 }
             })
@@ -775,7 +904,7 @@ impl Explorer {
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         let Some(u) = self.undo.pop() else {
@@ -788,7 +917,7 @@ impl Explorer {
         self.run_job(
             Job::Undo(kind),
             1,
-            move || u.revert(),
+            async move { u.revert() },
             move |report| (report.done == 0 && !report.errors.is_empty()).then_some(retry),
             cx,
         );
@@ -808,7 +937,7 @@ impl Explorer {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         let system = cx.read_from_clipboard();
@@ -835,7 +964,7 @@ impl Explorer {
     }
 
     fn paste_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, op: Op, cx: &mut Context<Self>) {
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         if op == Op::Move {
@@ -847,7 +976,7 @@ impl Explorer {
         self.run_job(
             Job::Op(op),
             n,
-            move || ops::paste_progress(&paths, &dest, op, label, Some(&progress)),
+            async move { ops::paste_progress(&paths, &dest, op, label, Some(&progress)) },
             move |r| {
                 let pairs = r.pairs.clone();
                 match op {
@@ -866,7 +995,7 @@ impl Explorer {
             self.run_job(
                 Job::Op(Op::Trash),
                 paths.len(),
-                move || ops::trash(&paths),
+                async move { ops::trash(&paths) },
                 move |r| (!r.trashed.is_empty()).then(|| Undo::Trash { paths: r.trashed.clone() }),
                 cx,
             );
@@ -884,12 +1013,12 @@ impl Explorer {
 
     fn confirm_delete(&mut self, cx: &mut Context<Self>) {
         if let Some(paths) = self.confirm.take() {
-            self.run_job(Job::Op(Op::Delete), paths.len(), move || ops::delete(&paths), |_| None, cx);
+            self.run_job(Job::Op(Op::Delete), paths.len(), async move { ops::delete(&paths) }, |_| None, cx);
         }
     }
 
     fn start_rename(&mut self, cx: &mut Context<Self>) {
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         let Some(e) = self.entries.get(self.cursor) else { return };
@@ -942,7 +1071,7 @@ impl Explorer {
     }
 
     fn new_folder(&mut self, cx: &mut Context<Self>) {
-        if !self.busy.is_empty() {
+        if !self.can_start_job() {
             return;
         }
         self.menu = None;
@@ -976,7 +1105,12 @@ impl Explorer {
             return;
         }
 
-        if let Some(input) = &mut self.location {
+        if let Some(location) = &mut self.location {
+            let input = match location {
+                LocationInput::Local(input)
+                | LocationInput::S3Profile(input)
+                | LocationInput::DownloadDestination(input, _) => input,
+            };
             match (command, key) {
                 (true, "v") => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -1023,21 +1157,24 @@ impl Explorer {
             return;
         }
 
+        let local = self.source.is_local();
         if command {
             match (m.shift, key) {
-                (false, "backspace") if cfg!(target_os = "macos") => self.trash_selection(cx),
-                (true, "backspace") if cfg!(target_os = "macos") => self.ask_delete(cx),
-                (false, "c") => self.copy_or_cut(Op::Copy, cx),
-                (false, "d") => self.toggle_pin(cx),
-                (false, "l") => self.edit_location(cx),
-                (false, "x") => self.copy_or_cut(Op::Move, cx),
-                (false, "v") => self.paste(cx),
+                (false, "backspace") if local && cfg!(target_os = "macos") => self.trash_selection(cx),
+                (true, "backspace") if local && cfg!(target_os = "macos") => self.ask_delete(cx),
+                (false, "c") if local => self.copy_or_cut(Op::Copy, cx),
+                (false, "d") if local => self.toggle_pin(cx),
+                (false, "d") => self.download_selection(cx),
+                (false, "l") if local => self.edit_location(cx),
+                (false, "l") => self.select_s3_profile(cx),
+                (false, "x") if local => self.copy_or_cut(Op::Move, cx),
+                (false, "v") if local => self.paste(cx),
                 (false, "a") => self.select_all(cx),
-                (false, "h") if cfg!(target_os = "linux") => self.toggle_hidden(cx),
-                (true, "." | ">") if cfg!(target_os = "macos") => self.toggle_hidden(cx),
+                (false, "h") if local && cfg!(target_os = "linux") => self.toggle_hidden(cx),
+                (true, "." | ">") if local && cfg!(target_os = "macos") => self.toggle_hidden(cx),
                 (false, "r") => self.reload(Vec::new(), cx),
-                (true, "n") => self.new_folder(cx),
-                (false, "z") => self.undo_last(cx),
+                (true, "n") if local => self.new_folder(cx),
+                (false, "z") if local => self.undo_last(cx),
                 (false, "q") if self.busy.is_empty() => cx.quit(),
                 _ => {}
             }
@@ -1052,7 +1189,7 @@ impl Explorer {
             (true, ..) => {}
             (_, true, "down") => self.move_cursor(1, true, cx),
             (_, true, "up") => self.move_cursor(-1, true, cx),
-            (_, true, "delete") => self.ask_delete(cx),
+            (_, true, "delete") if local => self.ask_delete(cx),
             (_, _, "down" | "j") => self.move_cursor(1, false, cx),
             (_, _, "up" | "k") => self.move_cursor(-1, false, cx),
             (_, _, "pagedown") => self.move_cursor(25, m.shift, cx),
@@ -1060,10 +1197,10 @@ impl Explorer {
             (_, _, "home" | "g") => self.move_cursor(isize::MIN, m.shift, cx),
             (_, _, "end") => self.move_cursor(isize::MAX, m.shift, cx),
             (_, _, "enter" | "right" | "l") => self.open_cursor(cx),
-            (_, _, "f2") => self.start_rename(cx),
+            (_, _, "f2") if local => self.start_rename(cx),
             (_, _, "f5") => self.reload(Vec::new(), cx),
-            (_, _, "delete") => self.trash_selection(cx),
-            (_, _, ".") => self.toggle_hidden(cx),
+            (_, _, "delete") if local => self.trash_selection(cx),
+            (_, _, ".") if local => self.toggle_hidden(cx),
             (_, _, "t") => self.cycle_theme(cx),
             (_, _, "i") => self.cycle_lang(cx),
             (_, _, "q") if self.busy.is_empty() => cx.quit(),
@@ -1092,7 +1229,7 @@ impl Explorer {
             .max_by_key(|(_, path)| path.as_os_str().len());
 
         let row = |section, i, path: &PathBuf, label: SharedString, icon: Icon, cx: &mut Context<Self>| {
-            let active = current == Some((section, path));
+            let active = self.source.is_local() && current == Some((section, path));
             let target = path.clone();
             div()
                 .id(SharedString::from(format!("{section}-{i}")))
@@ -1186,8 +1323,25 @@ impl Explorer {
             .child(div().flex_none().child(heading(s.places)).children(places))
             .child(
                 div()
+                    .id("s3")
+                    .role(Role::Button)
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .when(!self.source.is_local(), |d| d.bg(t.selection))
+                    .hover(|d| d.bg(t.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.select_s3_profile(cx)))
+                    .child(Icon::Globe.el(15.).text_color(t.accent))
+                    .child("Amazon S3"),
+            )
+            .child(
+                div()
                     .flex_none()
-                    .child(heading(s.pins).child(pin_button))
+                    .child(heading(s.pins).when(self.source.is_local(), |d| d.child(pin_button)))
                     .when(pins.is_empty(), |d| d.child(empty(s.no_pins)))
                     .children(pinned),
             )
@@ -1201,25 +1355,38 @@ impl Explorer {
     }
 
     /// Segmentos de la ruta actual, con "Inicio" para HOME y "…" si hay demasiados.
-    fn crumbs(&self) -> Vec<(SharedString, PathBuf)> {
+    fn crumbs(&self) -> Vec<(SharedString, Location)> {
         let mut out = Vec::new();
-        let (base_label, base, rest) = match &self.home {
-            Some(h) if self.cwd.starts_with(h) => {
-                (self.lang.t().home, h.clone(), self.cwd.strip_prefix(h).unwrap().to_path_buf())
+        match &self.source {
+            Location::S3(location) => {
+                let mut current = location.clone();
+                loop {
+                    out.push((current.label().into(), Location::S3(current.clone())));
+                    let Some((parent, _)) = current.parent() else { break };
+                    current = parent;
+                }
+                out.reverse();
             }
-            _ => ("/", PathBuf::from("/"), self.cwd.strip_prefix("/").unwrap_or(&self.cwd).to_path_buf()),
-        };
-        out.push((SharedString::from(base_label), base.clone()));
-        let mut acc = base;
-        for c in rest.components() {
-            acc.push(c);
-            out.push((c.as_os_str().to_string_lossy().into_owned().into(), acc.clone()));
+            Location::Local(path) => {
+                let (label, base) = match &self.home {
+                    Some(home) if path.starts_with(home) => (self.lang.t().home, home.as_path()),
+                    _ => ("/", Path::new("/")),
+                };
+                let mut accumulated = base.to_path_buf();
+                out.push((label.into(), Location::Local(accumulated.clone())));
+                for segment in path.strip_prefix(base).unwrap_or(path).components() {
+                    accumulated.push(segment);
+                    out.push((
+                        segment.as_os_str().to_string_lossy().into_owned().into(),
+                        Location::Local(accumulated.clone()),
+                    ));
+                }
+            }
         }
         if out.len() > 6 {
-            let tail = out.split_off(out.len() - 4);
-            out.truncate(1);
-            out.push(("…".into(), tail[0].1.parent().map(Path::to_path_buf).unwrap_or_default()));
-            out.extend(tail);
+            let hidden = out.len() - 5;
+            out[hidden].0 = "…".into();
+            out.drain(1..hidden);
         }
         out
     }
@@ -1251,7 +1418,7 @@ impl Explorer {
 
     fn render_toolbar(&self, t: &Theme, cx: &mut Context<Self>) -> Div {
         let crumbs = self.crumbs();
-        let last = crumbs.len() - 1;
+        let last = crumbs.len().saturating_sub(1);
         let mut trail = div()
             .flex_1()
             .min_w_0()
@@ -1289,13 +1456,18 @@ impl Explorer {
                     .truncate()
                     .hover(|d| d.bg(t.hover).text_color(t.text))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.navigate(path.clone(), None, cx);
+                        this.navigate_to(path.clone(), None, cx);
                     }))
                     .child(label),
             );
         }
 
-        if let Some(input) = &self.location {
+        if let Some(location) = &self.location {
+            let (input, placeholder) = match location {
+                LocationInput::Local(input) => (input, None),
+                LocationInput::S3Profile(input) => (input, Some(self.lang.t().aws_profile)),
+                LocationInput::DownloadDestination(input, _) => (input, Some(self.lang.t().download_destination)),
+            };
             let (before, selected, after) = input.parts();
             trail = div()
                 .flex_1()
@@ -1310,6 +1482,7 @@ impl Explorer {
                 .border_1()
                 .border_color(t.accent)
                 .bg(t.path_bg)
+                .when_some(placeholder, |d, label| d.child(div().flex_none().mr_2().text_color(t.muted).child(label)))
                 .child(SharedString::from(before.to_owned()))
                 .child(div().bg(t.text_selection).child(SharedString::from(selected.to_owned())))
                 .child(div().w(px(1.)).h(px(18.)).bg(t.accent))
@@ -1327,23 +1500,45 @@ impl Explorer {
             .border_1()
             .border_color(t.border)
             .rounded_md()
-            .child(
-                Self::toolbar_button(
-                    "new-folder",
-                    Icon::FolderPlus,
-                    s.new_folder,
-                    shortcut("Ctrl+Shift+N", "⇧⌘N"),
-                    false,
-                    *t,
+            .when(self.source.is_local(), |d| {
+                d.child(
+                    Self::toolbar_button(
+                        "new-folder",
+                        Icon::FolderPlus,
+                        s.new_folder,
+                        shortcut("Ctrl+Shift+N", "⇧⌘N"),
+                        false,
+                        *t,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_folder(cx))),
                 )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.new_folder(cx))),
-            )
-            .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(t.border))
-            .child(
-                Self::toolbar_button("hidden", Icon::Eye, s.hidden, shortcut("Ctrl+H", "⇧⌘."), self.show_hidden, *t)
+                .child(div().w(px(1.)).h(px(16.)).mx_0p5().bg(t.border))
+                .child(
+                    Self::toolbar_button(
+                        "hidden",
+                        Icon::Eye,
+                        s.hidden,
+                        shortcut("Ctrl+H", "⇧⌘."),
+                        self.show_hidden,
+                        *t,
+                    )
                     .aria_toggled(if self.show_hidden { Toggled::True } else { Toggled::False })
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_hidden(cx))),
-            )
+                )
+            })
+            .when(!self.source.is_local() && self.download_keys().next().is_some(), |d| {
+                d.child(
+                    Self::toolbar_button(
+                        "s3-download",
+                        Icon::Download,
+                        s.download,
+                        shortcut("Ctrl+D", "⌘D"),
+                        false,
+                        *t,
+                    )
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.download_selection(cx))),
+                )
+            })
             .child(
                 Self::toolbar_button("theme", theme_icon, theme_label, "T", false, *t)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_theme(cx))),
@@ -1437,7 +1632,7 @@ impl Explorer {
             .text_color(if e.kind == Kind::Other { t.muted } else { t.text })
             .when(is_cut, |d| d.opacity(0.55))
             .when(e.kind.is_dir(), |d| d.font_weight(FontWeight::MEDIUM))
-            .child(SharedString::from(e.name.to_string_lossy().into_owned()))
+            .child(SharedString::from(self.source.entry_label(e)))
             .into_any_element()
     }
 
@@ -1450,7 +1645,7 @@ impl Explorer {
             && self.focus.is_focused(window)
             && self.confirm.is_none()
             && self.renaming.is_none();
-        let cut = self.clip.as_ref().filter(|c| c.op == Op::Move).map(|c| &c.set);
+        let cut = self.clip.as_ref().filter(|c| self.source.is_local() && c.op == Op::Move).map(|c| &c.set);
         range
             .filter_map(|ix| self.entries.get(ix).map(|e| (ix, e)))
             .map(|(ix, e)| {
@@ -1520,7 +1715,19 @@ impl Explorer {
 
         // None = separador.
         let mut items: Vec<Option<(Icon, &'static str, &'static str, bool, Action)>> = Vec::new();
-        if menu.on_item {
+        if !self.source.is_local() {
+            if menu.on_item {
+                if single && self.entries.get(self.cursor).is_some_and(|entry| entry.kind.is_dir()) {
+                    items.push(Some((Icon::Open, s.open, "⏎", false, |this, cx| this.open_cursor(cx))));
+                }
+                if self.download_keys().next().is_some() {
+                    items.push(Some((Icon::Download, s.download, shortcut("Ctrl+D", "⌘D"), false, |this, cx| {
+                        this.download_selection(cx);
+                    })));
+                }
+            }
+            items.push(Some((Icon::Refresh, s.refresh, "F5", false, |this, cx| this.reload(Vec::new(), cx))));
+        } else if menu.on_item {
             if single {
                 items.push(Some((Icon::Open, s.open, "⏎", false, |this, cx| this.open_cursor(cx))));
                 items.push(None);
@@ -1712,6 +1919,7 @@ impl Explorer {
             let mut text = match job {
                 Job::Op(op) => self.lang.busy(op, n),
                 Job::Undo(_) => s.undoing.to_string(),
+                Job::Download => format!("{} · {n} {}", s.downloading, s.items),
             };
             let copied = self.progress.load(Ordering::Relaxed);
             if copied > 0 {
@@ -1731,6 +1939,10 @@ impl Explorer {
                 .text_color(t.muted)
                 .child(Icon::Undo.el(12.).text_color(t.accent))
                 .child(SharedString::from(self.lang.undone(*k))),
+            Some(Notice::Downloaded(n)) => base
+                .text_color(t.muted)
+                .child(Icon::Check.el(12.).text_color(t.image))
+                .child(format!("{n} {}", s.downloaded)),
             Some(Notice::Info(msg)) => base.text_color(t.muted).child(*msg),
             Some(Notice::Error(msg)) => base
                 .text_color(t.error)
@@ -1800,24 +2012,30 @@ impl Render for Explorer {
             .text_color(t.faint)
             .child(self.render_status(&t))
             .child(
-                div().min_w_0().flex().items_center().gap_3().child(div().min_w_0().truncate().child(s.hints)).child(
-                    div()
-                        .id("lang")
-                        .flex_none()
-                        .px_1p5()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(t.muted)
-                        .bg(t.control)
-                        .hover(|d| d.bg(t.hover))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_lang(cx)))
-                        .child(Icon::Globe.el(11.).text_color(t.muted))
-                        .child(self.lang.code()),
-                ),
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(self.source.is_local(), |d| d.child(div().min_w_0().truncate().child(s.hints)))
+                    .child(
+                        div()
+                            .id("lang")
+                            .flex_none()
+                            .px_1p5()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.muted)
+                            .bg(t.control)
+                            .hover(|d| d.bg(t.hover))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_lang(cx)))
+                            .child(Icon::Globe.el(11.).text_color(t.muted))
+                            .child(self.lang.code()),
+                    ),
             );
 
         let main = div()

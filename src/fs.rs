@@ -18,6 +18,12 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
 }
 
+impl Entry {
+    pub fn remote(key: &str, label: &str, kind: Kind, size: Option<u64>, modified: Option<SystemTime>) -> Self {
+        Self { name: key.into(), sort_key: label.to_lowercase(), kind, size, modified }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Dir,
