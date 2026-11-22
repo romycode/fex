@@ -428,6 +428,9 @@ mod tests {
                         Err(error) => panic!("waiting for {expected}: {error}"),
                     }
                 };
+                // En macOS (BSD) el socket aceptado hereda O_NONBLOCK del listener; en Linux no.
+                // Sin esto, leer antes de que llegue la petición da WouldBlock (solo en macOS).
+                socket.set_nonblocking(false).unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut reader = BufReader::new(&socket);
                 let mut request = String::new();
