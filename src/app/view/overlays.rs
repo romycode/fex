@@ -1,6 +1,5 @@
 //! Capas por encima de la vista: menú contextual, confirmación, informe de errores y paleta.
 
-use std::path::PathBuf;
 
 use gpui::{
     ClickEvent, Context, Div, FontWeight, MouseDownEvent, SharedString, Stateful, anchored, deferred, div, prelude::*,
@@ -10,6 +9,7 @@ use gpui::{
 use super::Explorer;
 use crate::{
     app::{Menu, Modal, commands},
+    backend::Item,
     icons::Icon,
     theme::{Theme, alpha},
 };
@@ -118,12 +118,12 @@ impl Explorer {
         .with_priority(1)
     }
 
-    pub(super) fn render_confirm(&self, paths: &[PathBuf], t: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(super) fn render_confirm(&self, paths: &[Item], t: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let s = self.lang.t();
         let preview = paths
             .iter()
             .take(3)
-            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .map(Item::name)
             .collect::<Vec<_>>()
             .join(", ")
             + if paths.len() > 3 { ", …" } else { "" };

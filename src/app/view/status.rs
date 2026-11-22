@@ -20,6 +20,8 @@ impl Explorer {
                 Job::Op(op) => self.lang.busy(op, n),
                 Job::Undo(_) => s.undoing.to_string(),
                 Job::Download => format!("{} · {n} {}", s.downloading, s.items),
+                Job::NewFolder => format!("{}…", s.new_folder),
+                Job::Rename => format!("{}…", s.rename),
             };
             let copied = self.jobs.progress.bytes.load(Ordering::Relaxed);
             if copied > 0 {
@@ -95,7 +97,7 @@ impl Explorer {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .when(self.caps().write, |d| d.child(div().min_w_0().truncate().child(s.hints)))
+                    .when(self.caps().trash, |d| d.child(div().min_w_0().truncate().child(s.hints)))
                     .child(
                         div()
                             .id("lang")

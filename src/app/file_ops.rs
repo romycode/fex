@@ -1,5 +1,6 @@
-//! Acciones sobre ficheros locales. La lógica de verdad vive en [`crate::ops`] y
-//! [`crate::undo`]; aquí solo se recoge la selección, se lanza el trabajo y se decide su deshacer.
+//! Acciones sobre elementos de cualquier backend. La lógica de verdad vive en
+//! [`crate::backend`], [`crate::ops`], [`crate::s3`] y [`crate::undo`]; aquí solo se recoge
+//! la selección, se lanza el trabajo y se decide su deshacer.
 
 use std::{ffi::OsStr, path::PathBuf};
 
@@ -7,21 +8,23 @@ use gpui::{ClipboardEntry, ClipboardItem, Context};
 
 use super::{Clip, Explorer, Modal, Rename, jobs::Job, jobs::Notice};
 use crate::{
+    backend::{self, Item, Location},
     input::LineInput,
     ops::{self, NameError, Op},
-    undo::Undo,
+    s3,
+    undo::{Undo, UndoKind},
 };
 
 impl Explorer {
     pub fn copy_or_cut(&mut self, op: Op, cx: &mut Context<Self>) {
-        let paths = self.target_paths();
-        if paths.is_empty() {
+        let items = self.target_items();
+        if items.is_empty() {
             return;
         }
-        // Rutas en texto plano: útil al pegar en una terminal o editor.
-        let text = paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n");
+        // Rutas o URIs s3:// en texto plano: útil al pegar en una terminal o editor.
+        let text = items.iter().map(Item::to_clipboard).collect::<Vec<_>>().join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-        self.clip = Some(Clip { set: paths.iter().cloned().collect(), paths, op, text });
+        self.clip = Some(Clip { set: items.iter().cloned().collect(), items, op, text });
         self.menu = None;
         cx.notify();
     }
@@ -31,30 +34,36 @@ impl Explorer {
             return;
         }
         let system = cx.read_from_clipboard();
-        let paths = system.as_ref().and_then(|clipboard| {
+        let external = system.as_ref().and_then(|clipboard| {
             clipboard.entries.iter().find_map(|entry| match entry {
                 ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => Some(paths.paths().to_vec()),
                 _ => None,
             })
         });
-        let parsed = paths.map(|paths| (paths, Op::Copy)).or_else(|| {
+        let local = |(paths, op): (Vec<PathBuf>, Op)| (paths.into_iter().map(Item::Local).collect::<Vec<_>>(), op);
+        let parsed = external.map(|paths| local((paths, Op::Copy))).or_else(|| {
             match (&self.clip, system.and_then(|clipboard| clipboard.text())) {
-                (Some(c), Some(t)) if t == c.text => Some((c.paths.clone(), c.op)),
-                (_, Some(t)) => ops::parse_clipboard(&t),
-                (Some(c), None) => Some((c.paths.clone(), c.op)),
+                (Some(c), Some(t)) if t == c.text => Some((c.items.clone(), c.op)),
+                (_, Some(t)) => ops::parse_clipboard(&t).map(local),
+                (Some(c), None) => Some((c.items.clone(), c.op)),
                 (None, None) => None,
             }
         });
-        let Some((paths, op)) = parsed else {
+        let Some((items, op)) = parsed else {
             self.menu = None;
             self.set_notice(Notice::Info(self.lang.t().nothing_to_paste), cx);
             return;
         };
-        self.paste_paths(paths, self.cwd.clone(), op, cx);
+        self.paste_items(items, self.source.clone(), op, cx);
     }
 
+    /// Pegar rutas locales en un directorio local (reintentos y tests).
     pub fn paste_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, op: Op, cx: &mut Context<Self>) {
-        if !self.can_start_job() {
+        self.paste_items(paths.into_iter().map(Item::Local).collect(), Location::Local(dest), op, cx);
+    }
+
+    pub fn paste_items(&mut self, items: Vec<Item>, dest: Location, op: Op, cx: &mut Context<Self>) {
+        if !self.can_start_job() || !dest.capabilities().write {
             return;
         }
         if op == Op::Move {
@@ -62,26 +71,19 @@ impl Explorer {
         }
         let progress = self.jobs.progress.clone();
         let label = self.lang.t().copy_suffix;
-        let n = paths.len();
+        let n = items.len();
         self.run_job(
             Job::Op(op),
             n,
-            async move { ops::paste_progress(&paths, &dest, op, label, Some(&progress)) },
-            move |r| {
-                let pairs = r.pairs.clone();
-                match op {
-                    _ if pairs.is_empty() => None,
-                    Op::Copy => Some(Undo::Copy { created: pairs.into_iter().map(|(_, to)| to).collect() }),
-                    _ => Some(Undo::Move { pairs }),
-                }
-            },
+            backend::paste(items, dest, op, label, progress),
+            move |report| backend::paste_undo(report, op),
             cx,
         );
     }
 
     pub fn trash_selection(&mut self, cx: &mut Context<Self>) {
         let paths = self.target_paths();
-        if !paths.is_empty() {
+        if !paths.is_empty() && self.caps().trash {
             self.run_job(
                 Job::Op(Op::Trash),
                 paths.len(),
@@ -93,9 +95,9 @@ impl Explorer {
     }
 
     pub fn ask_delete(&mut self, cx: &mut Context<Self>) {
-        let paths = self.target_paths();
-        if !paths.is_empty() {
-            self.modal = Modal::ConfirmDelete(paths);
+        let items = self.target_items();
+        if !items.is_empty() {
+            self.modal = Modal::ConfirmDelete(items);
             self.menu = None;
             cx.notify();
         }
@@ -105,8 +107,9 @@ impl Explorer {
         if !matches!(self.modal, Modal::ConfirmDelete(_)) {
             return;
         }
-        if let Modal::ConfirmDelete(paths) = std::mem::take(&mut self.modal) {
-            self.run_job(Job::Op(Op::Delete), paths.len(), async move { ops::delete(&paths) }, |_| None, cx);
+        if let Modal::ConfirmDelete(items) = std::mem::take(&mut self.modal) {
+            let progress = self.jobs.progress.clone();
+            self.run_job(Job::Op(Op::Delete), items.len(), backend::delete(items, progress), |_| None, cx);
         }
     }
 
@@ -115,11 +118,9 @@ impl Explorer {
             return;
         }
         let Some(e) = self.cursor_entry() else { return };
-        let stem = ops::stem_len(&e.name.to_string_lossy(), e.kind.is_dir());
-        self.modal = Modal::Rename(Rename {
-            original: e.name.clone(),
-            input: LineInput::new(e.name.to_string_lossy().into_owned(), stem),
-        });
+        let name = self.source.entry_name(e);
+        let stem = ops::stem_len(&name, e.kind.is_dir());
+        self.modal = Modal::Rename(Rename { original: e.name.clone(), input: LineInput::new(name, stem) });
         self.selection.clear_marks();
         self.menu = None;
         cx.notify();
@@ -131,6 +132,10 @@ impl Explorer {
         }
         let Modal::Rename(r) = std::mem::take(&mut self.modal) else { return };
         let new = r.input.text.trim().to_string();
+        if !self.source.is_local() {
+            self.commit_remote_rename(r, new, cx);
+            return;
+        }
         // Un único rename(2): no merece la pena ir a background.
         match ops::rename(&self.cwd, &r.original, &new) {
             Ok(()) => {
@@ -165,15 +170,71 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Renombrar fuera de local: copia + borrado en background.
+    fn commit_remote_rename(&mut self, r: Rename, new: String, cx: &mut Context<Self>) {
+        let entry = self.entries.iter().find(|e| e.name == r.original);
+        let Some(item) = entry.and_then(|e| self.source.item(e)) else { return };
+        if entry.is_some_and(|e| self.source.entry_name(e) == new) {
+            return;
+        }
+        if !ops::validate_name(&new) {
+            self.modal = Modal::Rename(r);
+            self.set_notice(Notice::Error(self.lang.t().invalid_name.into()), cx);
+            return;
+        }
+        // Renombrar una carpeta recién creada: un único paso de deshacer (crearla).
+        let fresh = match (self.jobs.undo.last(), &item) {
+            (Some(Undo::S3 { kind: UndoKind::NewFolder, change: s3::Change::Created(created) }), Item::S3(object))
+                if created.len() == 1 && created[0].object == *object =>
+            {
+                self.jobs.undo.pop()
+            }
+            _ => None,
+        };
+        self.run_job(
+            Job::Rename,
+            1,
+            backend::rename(item, new),
+            move |report| match (report.s3_moved.is_empty(), fresh) {
+                (true, fresh) => fresh,
+                (false, Some(_)) => Some(Undo::S3 {
+                    kind: UndoKind::NewFolder,
+                    change: s3::Change::Created(report.s3_moved.iter().map(|(_, now)| now.clone()).collect()),
+                }),
+                (false, None) => {
+                    Some(Undo::S3 { kind: UndoKind::Rename, change: s3::Change::Moved(report.s3_moved.clone()) })
+                }
+            },
+            cx,
+        );
+    }
+
     pub fn new_folder(&mut self, cx: &mut Context<Self>) {
-        if !self.can_start_job() {
+        if !self.can_start_job() || !self.caps().write {
             return;
         }
         self.menu = None;
         if matches!(self.modal, Modal::Rename(_)) {
             self.modal = Modal::None;
         }
-        match ops::mkdir(&self.cwd, self.lang.t().new_folder) {
+        let base = self.lang.t().new_folder;
+        if !self.source.is_local() {
+            self.run_job(
+                Job::NewFolder,
+                1,
+                backend::mkdir(self.source.clone(), base),
+                |report| {
+                    (!report.s3_created.is_empty()).then(|| Undo::S3 {
+                        kind: UndoKind::NewFolder,
+                        change: s3::Change::Created(report.s3_created.clone()),
+                    })
+                },
+                cx,
+            );
+            return;
+        }
+        // Local: un único mkdir(2), sin esperar a un hilo.
+        match ops::mkdir(&self.cwd, base) {
             Ok(name) => {
                 if let Ok(undo) = (Undo::NewFolder { path: self.cwd.join(&name) }).guard() {
                     self.jobs.push_undo(undo);

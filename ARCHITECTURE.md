@@ -17,8 +17,8 @@ app/               aplicación (GPUI)
   view/            solo render: sidebar, toolbar, list, overlays, status
 keymap.rs          atajos como datos ("mod-shift-n") y diferencias Linux/macOS
 config.rs          directorio de configuración por plataforma
-backend.rs         Location + Capabilities  ← punto de extensión de backends
-fs.rs ops.rs safe_fs.rs undo.rs watch.rs sidebar.rs s3.rs
+backend.rs         Location, Item, Capabilities y operaciones comunes  ← extensión de backends
+fs.rs ops.rs safe_fs.rs undo.rs watch.rs sidebar.rs s3/ (listar y escribir; fake.rs para tests)
                    dominio puro, sin GPUI, con tests propios
 theme.rs icons.rs i18n.rs input.rs
                    presentación compartida
@@ -62,10 +62,13 @@ Los tests de `commands.rs` comprueban que los ids no se repiten, que los atajos 
 Un backend es una variante de `backend::Location` (local y S3 hoy). Para añadir uno (SFTP, WebDAV, un zip…):
 
 1. Crea un módulo con su propia `Location` (como `s3::Location`) y una función `list` async que devuelva `Vec<fs::Entry>`.
-2. Añade la variante a `backend::Location` y completa los `match`: `list`, `child`, `parent`, `entry_label`.
-3. Declara qué soporta en `capabilities()`. Los comandos consultan `Capabilities` (escribir, abrir ficheros, descargar, vigilar cambios…), así que todo lo que el backend no soporta desaparece solo de los menús, la barra y la paleta.
+2. Añade la variante a `backend::Location` y a `backend::Item` (un elemento concreto: fichero, objeto…) y completa los `match`: `list`, `child`, `parent`, `entry_label`, `item`.
+3. Declara qué soporta en `capabilities()`. Los comandos consultan `Capabilities` (escribir, papelera, abrir ficheros, descargar, vigilar cambios…), así que todo lo que el backend no soporta desaparece solo de los menús, la barra y la paleta.
+4. Si escribe, completa las operaciones de `backend.rs` (`paste`, `delete`, `rename`, `mkdir`). `paste` elige el motor según el par origen → destino: local→local (`ops`), local→S3 (`s3::upload`), S3→local (`s3::download`), S3→S3 (`s3::copy`). Cada motor devuelve un `ops::Report`; `paste_undo` decide qué apilar para deshacer.
 
-Lo que todavía no está abstraído: las operaciones de escritura (`ops.rs`) trabajan con rutas locales. Un backend que escriba necesitará una operación propia lanzada con `run_job`, igual que la descarga de S3.
+La política es la misma para todos los backends: **nunca sobrescribir** y **nunca borrar algo que haya cambiado desde que se leyó**. En local se consigue con `rename` exclusivo y `safe_fs::Snapshot`; en S3, con escrituras condicionales (`If-None-Match`, `If-Match` y ETags). Un backend nuevo debe dar las mismas garantías o no declarar `write`.
+
+`s3/fake.rs` es un S3 en memoria que habla HTTP con el SDK real. Sirve para probar el motor de escritura sin AWS (ver el test de `s3/write.rs`).
 
 ## Trabajos en segundo plano
 

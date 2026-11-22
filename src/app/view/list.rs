@@ -84,13 +84,13 @@ impl Explorer {
         let tabular_numbers = TABULAR_NUMBERS.get_or_init(|| FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
         let list_focused =
             window.is_window_active() && self.focus.is_focused(window) && matches!(self.modal, Modal::None);
-        let cut = self.clip.as_ref().filter(|c| self.source.is_local() && c.op == Op::Move).map(|c| &c.set);
+        let cut = self.clip.as_ref().filter(|c| c.op == Op::Move).map(|c| &c.set);
         range
             .filter_map(|ix| self.entries.get(ix).map(|e| (ix, e)))
             .map(|(ix, e)| {
                 let selected = self.selection.is_selected(ix, &e.name);
                 let focused = list_focused && ix == self.selection.cursor;
-                let is_cut = cut.is_some_and(|set| set.contains(&self.cwd.join(&e.name)));
+                let is_cut = cut.is_some_and(|set| self.source.item(e).is_some_and(|item| set.contains(&item)));
                 div()
                     .id(ix)
                     .w_full()

@@ -274,14 +274,14 @@ impl Explorer {
     }
 
     pub fn download_selection(&mut self, cx: &mut Context<Self>) {
-        if !self.can_start_job() {
+        if !self.can_start_job() || !self.caps().download {
             return;
         }
-        let keys = self.download_keys().map(str::to_owned).collect::<Vec<_>>();
-        if keys.is_empty() {
+        let items = self.target_items();
+        if items.is_empty() {
             return;
         }
-        let request = DownloadRequest { source: self.source.clone(), keys };
+        let request = DownloadRequest { items };
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -312,9 +312,13 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Descargar = pegar en un directorio local elegido (copia, con deshacer a la papelera).
     fn start_download(&mut self, request: DownloadRequest, directory: PathBuf, cx: &mut Context<Self>) {
-        let progress = self.jobs.progress.bytes.clone();
-        let DownloadRequest { source, keys } = request;
-        self.run_job(super::jobs::Job::Download, keys.len(), source.download(keys, directory, progress), |_| None, cx);
+        let progress = self.jobs.progress.clone();
+        let label = self.lang.t().copy_suffix;
+        let items = request.items;
+        let n = items.len();
+        let work = crate::backend::paste(items, Location::Local(directory), crate::ops::Op::Copy, label, progress);
+        self.run_job(super::jobs::Job::Download, n, work, |report| crate::backend::paste_undo(report, crate::ops::Op::Copy), cx);
     }
 }

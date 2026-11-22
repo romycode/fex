@@ -27,7 +27,7 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{AppContext, Context, FocusHandle, KeyDownEvent, Pixels, Point, Subscription, Task, UniformListScrollHandle, Window};
 
 use crate::{
-    backend::{Capabilities, Location},
+    backend::{Capabilities, Item, Location},
     fs::{self, Entry, Place, SortColumn},
     i18n::Lang,
     input::{InputResult, LineInput},
@@ -43,8 +43,8 @@ use selection::Selection;
 /// Portapapeles interno. `text` es lo que escribimos en el del sistema: si al pegar
 /// sigue ahí, usamos esto (conserva copiar/cortar y rutas no UTF-8).
 pub struct Clip {
-    pub paths: Vec<PathBuf>,
-    pub set: HashSet<PathBuf>,
+    pub items: Vec<Item>,
+    pub set: HashSet<Item>,
     pub op: Op,
     pub text: String,
 }
@@ -64,8 +64,7 @@ impl LocationInput {
 }
 
 pub struct DownloadRequest {
-    pub source: Location,
-    pub keys: Vec<String>,
+    pub items: Vec<Item>,
 }
 
 pub struct Rename {
@@ -90,7 +89,7 @@ pub enum Modal {
     Rename(Rename),
     Location(LocationInput),
     Palette(Palette),
-    ConfirmDelete(Vec<PathBuf>),
+    ConfirmDelete(Vec<Item>),
     Errors(Vec<String>),
 }
 
@@ -255,22 +254,31 @@ impl Explorer {
         self.entries.get(self.selection.cursor)
     }
 
+    #[cfg(all(test, feature = "ui-tests"))]
     pub fn target_names(&self) -> Vec<OsString> {
         self.selection.targets(&self.entries)
     }
 
-    /// Rutas locales afectadas por una acción. Vacío fuera del sistema de ficheros local.
-    pub fn target_paths(&self) -> Vec<PathBuf> {
-        if !self.source.is_local() {
-            return Vec::new();
-        }
-        self.target_names().into_iter().map(|n| self.cwd.join(n)).collect()
+    /// Elementos afectados por una acción (cualquier backend). Vacío en la lista de buckets.
+    pub fn target_items(&self) -> Vec<Item> {
+        // O(n): la selección se consulta por índice, sin buscar nombres (100k+ entradas).
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(i, entry)| self.selection.is_selected(*i, &entry.name))
+            .filter_map(|(_, entry)| self.source.item(entry))
+            .collect()
     }
 
-    pub fn download_keys(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().enumerate().filter_map(|(i, entry)| {
-            if self.selection.is_selected(i, &entry.name) { self.source.download_key(entry) } else { None }
-        })
+    /// Rutas locales afectadas por una acción. Vacío fuera del sistema de ficheros local.
+    pub fn target_paths(&self) -> Vec<PathBuf> {
+        self.target_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Local(path) => Some(path),
+                Item::S3(_) => None,
+            })
+            .collect()
     }
 
     pub fn is_pinned(&self) -> bool {

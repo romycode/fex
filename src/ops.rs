@@ -35,12 +35,12 @@ impl Progress {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    fn add(&self, bytes: u64) {
+    pub fn add(&self, bytes: u64) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Error `Interrupted` si se pidió cancelar. Se comprueba entre bloques y entre entradas.
-    fn check(progress: Option<&Self>) -> io::Result<()> {
+    pub fn check(progress: Option<&Self>) -> io::Result<()> {
         if progress.is_some_and(Self::is_cancelled) {
             Err(io::Error::new(io::ErrorKind::Interrupted, "cancelado"))
         } else {
@@ -95,6 +95,10 @@ pub struct Report {
     pub pairs: Vec<(PathBuf, PathBuf)>,
     /// Rutas enviadas a la papelera con éxito.
     pub trashed: Vec<Trashed>,
+    /// Objetos de S3 creados (con su ETag): deshacer los borra solo si siguen igual.
+    pub s3_created: Vec<crate::s3::Stored>,
+    /// Objetos de S3 movidos: (origen, destino actual con su ETag).
+    pub s3_moved: Vec<(crate::s3::Object, crate::s3::Stored)>,
     pub done: usize,
     pub errors: Vec<OpError>,
 }
@@ -129,7 +133,12 @@ fn split_name(name: &str, is_dir: bool) -> (&str, &str) {
 
 /// Primer nombre libre en `dir`. Con `label` (p. ej. "copia") siempre añade sufijo.
 pub fn unique_name(dir: &Path, name: &str, is_dir: bool, label: Option<&str>) -> String {
-    if label.is_none() && !exists(&dir.join(name)) {
+    unique_name_by(name, is_dir, label, |candidate| exists(&dir.join(candidate)))
+}
+
+/// Como [`unique_name`], pero con cualquier criterio de ocupado (p. ej. nombres de un prefijo S3).
+pub fn unique_name_by(name: &str, is_dir: bool, label: Option<&str>, taken: impl Fn(&str) -> bool) -> String {
+    if label.is_none() && !taken(name) {
         return name.to_owned();
     }
     let (stem, ext) = split_name(name, is_dir);
@@ -140,7 +149,7 @@ pub fn unique_name(dir: &Path, name: &str, is_dir: bool, label: Option<&str>) ->
             (None, 1) => None,
             (None, n) => Some(format!("{stem} ({n}){ext}")),
         })
-        .find(|cand| !exists(&dir.join(cand)))
+        .find(|cand| !taken(cand))
         .expect("rango infinito")
 }
 

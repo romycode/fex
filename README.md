@@ -77,6 +77,25 @@ Atajos en Linux:
 
 En macOS usa `⌘` en los atajos con `Ctrl` y para alternar la selección con clic. Los archivos ocultos se alternan con `⇧⌘.`. Para mover a la papelera usa `⌘⌫`, y para el borrado permanente `⇧⌘⌫`.
 
+## Amazon S3
+
+En la barra lateral, **Amazon S3** pide un perfil de AWS (vacío = credenciales por defecto) y lista los buckets. Dentro de un bucket funcionan las mismas acciones que en local:
+
+- **copiar, cortar y pegar** entre local y S3 en cualquier sentido, y entre buckets del mismo perfil (copia servidor a servidor, sin pasar por tu máquina). Las carpetas se copian enteras.
+- **renombrar, nueva carpeta y borrar.** S3 no tiene papelera: `Supr` pide confirmación y borra de forma permanente.
+- **descargar** (`Ctrl+D` / `⌘D`) ficheros o carpetas a una carpeta local elegida.
+- **deshacer** copias, movimientos dentro de S3, renombrados y carpetas nuevas. Mover entre local y S3 no se puede deshacer.
+- **cancelar** desde el pie de la ventana, como en local.
+
+Garantías, iguales que en local:
+
+- **Nunca sobrescribe.** Las escrituras usan `If-None-Match: *`: si el destino ya existe, S3 las rechaza y fex elige otro nombre ("x (2).txt").
+- **Nunca borra ni mueve algo que haya cambiado.** Los borrados y las copias de origen usan el ETag leído (`If-Match`). Si otro proceso modificó el objeto entretanto, la operación se detiene y lo avisa.
+- **Sin carpetas a medias.** Si falla a mitad de una carpeta, se borra lo que ya se había copiado de ella. Las descargas se montan en un temporal y se publican enteras.
+- Los ficheros grandes se suben por partes (subida multiparte) y las copias de más de 5 GB también.
+
+Permisos IAM necesarios: `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` y `s3:AbortMultipartUpload`. Los servicios compatibles con S3 (MinIO, R2…) deben admitir escrituras condicionales (`If-None-Match`); si no, las escrituras fallan en vez de sobrescribir.
+
 ## Atajos personalizados
 
 Los atajos se cambian en un fichero de texto: `~/.config/fex/keymap` en Linux (respeta `XDG_CONFIG_HOME`) y `~/Library/Application Support/fex/keymap` en macOS. Lo más cómodo es abrirlo desde la paleta con **Editar atajos de teclado**: la primera vez se crea con todos los comandos comentados. También se puede ver la plantilla con `fex --list-commands`.
@@ -184,7 +203,8 @@ No incluye todavía:
 - miniaturas
 - rehacer (Ctrl+Shift+Z) y vista de la papelera
 - diálogo de conflictos: ahora siempre se renombra automáticamente
-- porcentaje total y cancelación de copias (ya se muestran bytes copiados)
+- porcentaje total de las copias (ya se muestran bytes copiados y se pueden cancelar)
+- copiar entre perfiles de AWS distintos
 - el campo de renombrado no soporta IME ni selección con ratón
 - DnD
 - pestañas

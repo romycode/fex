@@ -23,6 +23,9 @@ pub enum Job {
     Op(Op),
     Undo(UndoKind),
     Download,
+    /// Fuera de local, crear carpeta y renombrar también van en background.
+    NewFolder,
+    Rename,
 }
 
 pub enum Notice {
@@ -107,7 +110,7 @@ impl Explorer {
         if !self.can_start_job() {
             return;
         }
-        let cwd = self.cwd.clone();
+        let origin = self.source.clone();
         let id = self.jobs.next_id;
         self.jobs.next_id += 1;
         self.jobs.progress.reset();
@@ -153,7 +156,7 @@ impl Explorer {
 
         cx.spawn(async move |this, cx| {
             let Ok((report, undo)) = rx.await else { return };
-            this.update(cx, |this, cx| this.finish_job(id, job, cwd, report, undo, cx)).ok();
+            this.update(cx, |this, cx| this.finish_job(id, job, origin, report, undo, cx)).ok();
         })
         .detach();
     }
@@ -162,7 +165,7 @@ impl Explorer {
         &mut self,
         id: u64,
         job: Job,
-        cwd: std::path::PathBuf,
+        origin: crate::backend::Location,
         report: ops::Report,
         undo: Option<Undo>,
         cx: &mut Context<Self>,
@@ -177,24 +180,43 @@ impl Explorer {
                 Job::Op(op) => self.lang.done(op, report.done),
                 Job::Undo(_) => self.lang.t().undo.into(),
                 Job::Download => format!("{} {}", report.done, self.lang.t().downloaded),
+                Job::NewFolder => self.lang.t().new_folder.into(),
+                Job::Rename => self.lang.t().rename.into(),
             }];
             details.extend(report.errors.iter().map(|error| self.describe_errors(std::slice::from_ref(error))));
             self.modal = Modal::Errors(details);
         }
         let notice = match (report.errors.is_empty(), job) {
-            (false, _) => Notice::Error(self.describe_errors(&report.errors)),
-            (true, Job::Op(op)) => Notice::Done(op, report.done),
-            (true, Job::Undo(k)) => Notice::Undone(k),
-            (true, Job::Download) => Notice::Downloaded(report.done),
+            (false, _) => Some(Notice::Error(self.describe_errors(&report.errors))),
+            (true, Job::Op(op)) => Some(Notice::Done(op, report.done)),
+            (true, Job::Undo(k)) => Some(Notice::Undone(k)),
+            (true, Job::Download) => Some(Notice::Downloaded(report.done)),
+            (true, Job::NewFolder | Job::Rename) => None,
         };
-        self.set_notice(notice, cx);
-        let selected = report
-            .created_paths
-            .iter()
-            .filter(|path| path.parent() == Some(self.cwd.as_path()))
-            .filter_map(|path| path.file_name().map(OsStr::to_os_string))
-            .collect::<Vec<_>>();
-        if self.source.is_local() && (!selected.is_empty() || (!matches!(job, Job::Download) && self.cwd == cwd)) {
+        if let Some(notice) = notice {
+            self.set_notice(notice, cx);
+        }
+        // Lo creado queda seleccionado. En local se filtra por directorio (el trabajo pudo
+        // escribir en otro sitio); en S3, `created` ya son claves del listado.
+        let selected = if self.source.is_local() {
+            report
+                .created_paths
+                .iter()
+                .filter(|path| path.parent() == Some(self.cwd.as_path()))
+                .filter_map(|path| path.file_name().map(OsStr::to_os_string))
+                .collect::<Vec<_>>()
+        } else {
+            report.created.clone()
+        };
+        let here = self.source == origin;
+        if matches!(job, Job::NewFolder) && here {
+            self.pending_rename = report.created.first().cloned();
+        }
+        let affects_view = match job {
+            Job::Download => !selected.is_empty() && self.source.is_local(),
+            _ => here || (self.source.is_local() && !selected.is_empty()),
+        };
+        if affects_view {
             self.reload(selected, cx);
         }
     }

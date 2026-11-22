@@ -1,23 +1,19 @@
-use std::{
-    collections::HashMap,
-    io,
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::SystemTime,
-};
+//! Amazon S3: listar (aquí) y escribir ([`write`]).
+
+use std::{collections::HashMap, io, sync::Mutex, time::SystemTime};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{Client, config::Region, error::ProvideErrorMetadata, types::EncodingType};
 use percent_encoding::percent_decode_str;
-use tokio::{io::AsyncWriteExt, task::JoinSet};
+use tokio::task::JoinSet;
 
-use crate::{
-    fs::{Entry, Kind},
-    ops::{self, OpError, Report},
-};
+use crate::fs::{Entry, Kind};
+
+mod write;
+#[cfg(test)]
+mod fake;
+
+pub use write::{Change, Object, Stored, copy, delete, download, mkdir, rename, revert, upload};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Location {
@@ -64,6 +60,16 @@ impl Location {
         ))
     }
 
+    /// La carpeta actual como objeto S3 (prefijo). `None` en la lista de buckets.
+    pub fn as_object(&self) -> Option<Object> {
+        match self {
+            Self::Buckets { .. } => None,
+            Self::Prefix { profile, bucket, prefix } => {
+                Some(Object { profile: profile.clone(), bucket: bucket.clone(), key: prefix.clone() })
+            }
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Buckets { profile } => {
@@ -90,14 +96,42 @@ struct S3 {
     profiles: Mutex<HashMap<Option<String>, ProfileClients>>,
 }
 
+static SERVICE: once_cell::sync::OnceCell<S3> = once_cell::sync::OnceCell::new();
+
 fn service() -> io::Result<&'static S3> {
-    static SERVICE: once_cell::sync::OnceCell<S3> = once_cell::sync::OnceCell::new();
     SERVICE.get_or_try_init(|| {
         Ok(S3 {
             runtime: tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?,
             profiles: Mutex::default(),
         })
     })
+}
+
+/// Tests: todas las llamadas a S3 del proceso van a `endpoint` (un S3 falso en memoria).
+#[cfg(test)]
+fn use_endpoint_for_tests(endpoint: &str) {
+    let region = Region::new("us-east-1");
+    let client = Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(region.clone())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            // Cuerpos planos (sin aws-chunked) para que el servidor falso sea sencillo.
+            .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+            .build(),
+    );
+    let config = aws_config::SdkConfig::builder().region(region.clone()).build();
+    let regions = ["bucket", "other"].map(|b| (b.to_owned(), region.clone())).into();
+    let service = S3 {
+        runtime: tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap(),
+        profiles: Mutex::new(HashMap::from([(
+            None,
+            ProfileClients { config: Some(config), clients: HashMap::from([(region, client)]), regions },
+        )])),
+    };
+    assert!(SERVICE.set(service).is_ok(), "el S3 de tests solo se instala una vez");
 }
 
 impl S3 {
@@ -243,81 +277,6 @@ pub async fn list(location: Location) -> io::Result<Vec<Entry>> {
     requests.join_next().await.expect("one S3 listing task").map_err(io::Error::other)?
 }
 
-fn destination(directory: &Path, key: &str) -> io::Result<PathBuf> {
-    let name = key.rsplit('/').next().unwrap_or_default();
-    if !ops::validate_name(name) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid local file name"));
-    }
-    Ok(directory.join(name))
-}
-
-pub async fn download(location: Location, keys: Vec<String>, directory: PathBuf, progress: Arc<AtomicU64>) -> Report {
-    let result = async {
-        let service = service()?;
-        let mut requests = JoinSet::new();
-        requests.spawn_on(download_objects(service, location, keys, directory, progress), service.runtime.handle());
-        requests.join_next().await.expect("one S3 download task").map_err(io::Error::other)
-    }
-    .await;
-    result.unwrap_or_else(|error| Report { errors: vec![OpError::Io("Amazon S3".into(), error)], ..Report::default() })
-}
-
-async fn download_objects(
-    service: &S3,
-    location: Location,
-    keys: Vec<String>,
-    directory: PathBuf,
-    progress: Arc<AtomicU64>,
-) -> Report {
-    let mut report = Report::default();
-    let Location::Prefix { profile, bucket, .. } = location else {
-        return report;
-    };
-    let client = service.bucket_client(&profile, &bucket).await;
-    for key in keys {
-        match download_object(&client, &bucket, &key, &directory, &progress).await {
-            Ok(path) => {
-                report.done += 1;
-                report.created_paths.push(path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                report.errors.push(OpError::Exists(key));
-            }
-            Err(error) => report.errors.push(OpError::Io(key, error)),
-        }
-    }
-    report
-}
-
-async fn download_object(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    directory: &Path,
-    progress: &AtomicU64,
-) -> io::Result<PathBuf> {
-    let path = destination(directory, key)?;
-    if ops::exists(&path) {
-        return Err(io::ErrorKind::AlreadyExists.into());
-    }
-    let pending = tempfile::Builder::new().prefix(".fex-download-").tempfile_in(directory)?;
-    let mut file = tokio::fs::File::from_std(pending.reopen()?);
-    let mut output = client.get_object().bucket(bucket).key(key).send().await.map_err(sdk_error)?;
-    let mut written = 0;
-    while let Some(chunk) = output.body.try_next().await.map_err(io::Error::other)? {
-        file.write_all(&chunk).await?;
-        written += chunk.len() as u64;
-        progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-    }
-    if output.content_length().and_then(|n| u64::try_from(n).ok()).is_some_and(|n| n != written) {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete S3 download"));
-    }
-    file.flush().await?;
-    drop(file);
-    pending.persist_noclobber(&path).map_err(|error| error.error)?;
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,22 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn local_destination_cannot_escape_the_chosen_folder() {
-        let dir = Path::new("/downloads");
-        assert_eq!(destination(dir, "../../file").unwrap(), dir.join("file"));
-        for key in ["", ".", "..", "foo/..", "foo/", "a\0b"] {
-            assert!(destination(dir, key).is_err(), "{key:?}");
-        }
-    }
-
-    #[test]
     fn url_decoding_preserves_literal_plus_and_percent() {
         assert_eq!(decode_key("folder%2Fa%2Bb%252F", true).unwrap(), "folder/a+b%2F");
         assert_eq!(decode_key("a%2Bb+", false).unwrap(), "a%2Bb+");
     }
 
     #[test]
-    fn paginates_and_downloads_via_the_sdk() {
+    fn paginates_listings_via_the_sdk() {
         use std::{
             io::{BufRead, BufReader, Write},
             net::TcpListener,
@@ -360,25 +310,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let directory = tempfile::tempdir().unwrap();
-        let occupied_after_request = directory.path().join("race.txt");
         let responder = thread::spawn(move || {
             let responses = [
                 (
                     "list-type=2",
                     r#"<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><NextContinuationToken>page-two</NextContinuationToken><CommonPrefixes><Prefix>folder%2F</Prefix></CommonPrefixes></ListBucketResult>"#,
-                    None,
                 ),
                 (
                     "continuation-token=page-two",
                     r#"<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>file%2B%252F.txt</Key><Size>3</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents></ListBucketResult>"#,
-                    None,
                 ),
-                ("/bucket/file%2B%252F.txt", "abc", None),
-                ("/bucket/truncated.txt", "short", Some(12)),
-                ("/bucket/race.txt", "download", None),
             ];
-            for (expected, body, length) in responses {
+            for (expected, body) in responses {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut socket = loop {
                     match listener.accept() {
@@ -400,13 +343,10 @@ mod tests {
                         break;
                     }
                 }
-                if expected == "/bucket/race.txt" {
-                    std::fs::write(&occupied_after_request, "existing").unwrap();
-                }
                 write!(
                     socket,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    length.unwrap_or(body.len()),
+                    body.len(),
                 )
                 .unwrap();
             }
@@ -436,7 +376,6 @@ mod tests {
             )])),
         };
         let location = Location::Buckets { profile: None }.child("bucket").unwrap();
-        let progress = AtomicU64::new(0);
         service.runtime.block_on(async {
             let entries = service.list(&location).await.unwrap();
             assert_eq!(entries.len(), 2);
@@ -445,18 +384,6 @@ mod tests {
             let file = &entries[1];
             assert_eq!(file.size, Some(3));
             assert!(file.modified.is_some());
-            let key = file.name.to_str().unwrap();
-            let path = download_object(&client, "bucket", key, directory.path(), &progress).await.unwrap();
-            assert_eq!(path.file_name().unwrap(), "file+%2F.txt");
-            assert_eq!(std::fs::read(&path).unwrap(), b"abc");
-            assert_eq!(progress.load(Ordering::Relaxed), 3);
-            let collision = download_object(&client, "bucket", key, directory.path(), &progress).await.unwrap_err();
-            assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
-            assert!(download_object(&client, "bucket", "truncated.txt", directory.path(), &progress).await.is_err());
-            let race = download_object(&client, "bucket", "race.txt", directory.path(), &progress).await.unwrap_err();
-            assert_eq!(race.kind(), io::ErrorKind::AlreadyExists);
-            assert_eq!(std::fs::read(directory.path().join("race.txt")).unwrap(), b"existing");
-            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
         });
         responder.join().unwrap();
     }

@@ -98,7 +98,11 @@ fn writable(e: &Explorer) -> bool {
     e.caps().write && e.can_start_job()
 }
 fn writable_with_targets(e: &Explorer) -> bool {
-    writable(e) && has_entries(e)
+    writable(e) && has_items(e)
+}
+/// Hay algo seleccionado sobre lo que actuar (en la lista de buckets, no).
+fn has_items(e: &Explorer) -> bool {
+    !e.target_items().is_empty()
 }
 
 /// Todos los comandos. El orden importa para resolver atajos compartidos.
@@ -150,11 +154,11 @@ pub static COMMANDS: &[Command] = &[
     cmd("file.cut", |s| s.cut, |e, cx| e.copy_or_cut(Op::Move, cx))
         .icon(Icon::Cut)
         .keys(&["mod-x"])
-        .when(|e| e.caps().write && has_entries(e)),
+        .when(|e| e.caps().write && has_items(e)),
     cmd("file.copy", |s| s.copy, |e, cx| e.copy_or_cut(Op::Copy, cx))
         .icon(Icon::Copy)
         .keys(&["mod-c"])
-        .when(|e| e.caps().write && has_entries(e)),
+        .when(has_items),
     cmd("file.paste", |s| s.paste, |e, cx| e.paste(cx)).icon(Icon::Paste).keys(&["mod-v"]).when(writable),
     cmd("file.rename", |s| s.rename, |e, cx| e.start_rename(cx))
         .icon(Icon::Pencil)
@@ -167,20 +171,21 @@ pub static COMMANDS: &[Command] = &[
     cmd("file.trash", |s| s.trash, |e, cx| e.trash_selection(cx))
         .icon(Icon::Trash)
         .keys(&["mac:mod-backspace", "delete"])
-        .when(writable_with_targets),
+        .when(|e| e.caps().trash && writable_with_targets(e)),
     cmd("file.delete", |s| s.delete, |e, cx| e.ask_delete(cx))
         .icon(Icon::DeleteForever)
-        .keys(&["mac:mod-shift-backspace", "shift-delete"])
+        // Sin papelera (S3), Supr y ⌘⌫ piden borrar permanentemente: `file.trash` va antes.
+        .keys(&["mac:mod-shift-backspace", "shift-delete", "delete", "mac:mod-backspace"])
         .when(writable_with_targets)
         .danger(),
     cmd("file.undo", |s| s.undo, |e, cx| e.undo_last(cx))
         .icon(Icon::Undo)
         .keys(&["mod-z"])
-        .when(|e| writable(e) && !e.jobs.undo.is_empty()),
+        .when(|e| e.can_start_job() && !e.jobs.undo.is_empty()),
     cmd("file.download", |s| s.download, |e, cx| e.download_selection(cx))
         .icon(Icon::Download)
         .keys(&["mod-d"])
-        .when(|e| e.caps().download && e.can_start_job() && e.download_keys().next().is_some()),
+        .when(|e| e.caps().download && e.can_start_job() && has_items(e)),
     cmd("job.cancel", |s| s.cancel_job, |e, cx| e.cancel_job(cx))
         .icon(Icon::Close)
         .when(|e| e.is_busy() && !e.jobs.progress.is_cancelled()),
@@ -319,7 +324,8 @@ mod tests {
     fn shortcuts_are_consistent_on_linux_and_macos() {
         use keymap::{Chord, Platform};
         // Atajos compartidos a propósito: local vs. S3.
-        const SHARED: &[&str] = &["mod-d", "mod-l"];
+        // Papelera vs. borrado permanente: el segundo solo responde donde no hay papelera.
+        const SHARED: &[&str] = &["mod-d", "mod-l", "delete", "mod-backspace"];
         for platform in [Platform::Linux, Platform::Mac] {
             let mut owners: std::collections::HashMap<Chord, Vec<&str>> = Default::default();
             for command in COMMANDS {
