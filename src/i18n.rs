@@ -216,6 +216,11 @@ enum Unit {
 }
 
 pub struct Strings {
+    pub aws_profile: &'static str,
+    pub download: &'static str,
+    pub download_destination: &'static str,
+    pub downloading: &'static str,
+    pub downloaded: &'static str,
     pub retry: &'static str,
     pub places: &'static str,
     pub pins: &'static str,
@@ -271,6 +276,11 @@ pub struct Strings {
 }
 
 static ES: Strings = Strings {
+    aws_profile: "Perfil de AWS (opcional)",
+    download: "Descargar",
+    download_destination: "Carpeta de destino",
+    downloading: "Descargando…",
+    downloaded: "descargas completadas",
     retry: "Reintentar pendientes",
     places: "Lugares",
     pins: "Carpetas fijadas",
@@ -330,6 +340,11 @@ static ES: Strings = Strings {
 };
 
 static CA: Strings = Strings {
+    aws_profile: "Perfil d’AWS (opcional)",
+    download: "Baixa",
+    download_destination: "Carpeta de destinació",
+    downloading: "Baixant…",
+    downloaded: "baixades completades",
     retry: "Torna a provar els pendents",
     places: "Llocs",
     pins: "Carpetes fixades",
@@ -389,6 +404,11 @@ static CA: Strings = Strings {
 };
 
 static EN: Strings = Strings {
+    aws_profile: "AWS profile (optional)",
+    download: "Download",
+    download_destination: "Download destination",
+    downloading: "Downloading…",
+    downloaded: "downloads completed",
     retry: "Retry pending items",
     places: "Places",
     pins: "Pinned folders",
