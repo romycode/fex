@@ -1,4 +1,4 @@
-//! Operaciones de ficheros. Todo bloqueante: se llama siempre desde `background_spawn`.
+//! Operaciones de ficheros. Todo bloqueante: se llama siempre desde un hilo de trabajo.
 //!
 //! Política: nunca se sobrescribe nada. Si el destino existe, se genera un nombre libre
 //! ("x (copia).txt", "x (2).txt").
@@ -8,8 +8,46 @@ use std::{
     fs, io,
     os::unix::{ffi::OsStringExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
+
+/// Progreso compartido entre el hilo de trabajo y la UI: bytes copiados y petición de cancelar.
+#[derive(Clone, Default, Debug)]
+pub struct Progress {
+    pub bytes: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Progress {
+    pub fn reset(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        self.cancelled.store(false, Ordering::Relaxed);
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Error `Interrupted` si se pidió cancelar. Se comprueba entre bloques y entre entradas.
+    fn check(progress: Option<&Self>) -> io::Result<()> {
+        if progress.is_some_and(Self::is_cancelled) {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelado"))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
@@ -123,7 +161,7 @@ pub fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     copy_with_progress(src, dst, None)
 }
 
-fn copy_with_progress(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
+fn copy_with_progress(src: &Path, dst: &Path, progress: Option<&Progress>) -> io::Result<()> {
     let parent = dst.parent().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let source = crate::safe_fs::Snapshot::capture(src)?;
     let pending = tempfile::Builder::new().prefix(".fex-copy-").tempdir_in(parent)?;
@@ -133,7 +171,8 @@ fn copy_with_progress(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> i
     crate::safe_fs::rename_exclusive(&staged, dst)
 }
 
-fn copy_tree(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
+fn copy_tree(src: &Path, dst: &Path, progress: Option<&Progress>) -> io::Result<()> {
+    Progress::check(progress)?;
     let meta = fs::symlink_metadata(src)?;
     if meta.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)
@@ -158,7 +197,8 @@ fn copy_tree(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result
             }
             output.write_all(&buffer[..count])?;
             if let Some(progress) = progress {
-                progress.fetch_add(count as u64, Ordering::Relaxed);
+                progress.add(count as u64);
+                Progress::check(Some(progress))?;
             }
         }
         copy_metadata(&input, &output, &meta)?;
@@ -195,7 +235,7 @@ pub fn move_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     move_with_progress(src, dst, None)
 }
 
-fn move_with_progress(src: &Path, dst: &Path, progress: Option<&AtomicU64>) -> io::Result<()> {
+fn move_with_progress(src: &Path, dst: &Path, progress: Option<&Progress>) -> io::Result<()> {
     match crate::safe_fs::rename_exclusive(src, dst) {
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
             let source = crate::safe_fs::Snapshot::capture(src)?;
@@ -226,10 +266,16 @@ pub fn paste(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str) -> Report 
     paste_progress(srcs, dest, op, copy_label, None)
 }
 
-pub fn paste_progress(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str, progress: Option<&AtomicU64>) -> Report {
+pub fn paste_progress(srcs: &[PathBuf], dest: &Path, op: Op, copy_label: &str, progress: Option<&Progress>) -> Report {
     let mut r = Report::default();
     let mut retry_sources = Vec::new();
-    for src in srcs {
+    for (index, src) in srcs.iter().enumerate() {
+        if progress.is_some_and(Progress::is_cancelled) {
+            // Lo que no se llegó a empezar queda pendiente para reintentar.
+            retry_sources.extend(srcs[index..].iter().cloned());
+            r.errors.push(OpError::Io(file_name(src), io::Error::new(io::ErrorKind::Interrupted, "cancelado")));
+            break;
+        }
         let name = file_name(src);
         let is_dir = fs::symlink_metadata(src).map(|m| m.is_dir()).unwrap_or(false);
 
@@ -612,6 +658,35 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(fs::read_to_string(destination.join("item")).unwrap(), "original");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn cancelled_paste_publishes_nothing_and_keeps_everything_for_retry() {
+        let t = Tmp::new();
+        let first = t.file("source/first", "1");
+        let second = t.file("source/second", "2");
+        let destination = t.0.join("destination");
+        fs::create_dir(&destination).unwrap();
+        let progress = Progress::default();
+        progress.cancel();
+        let report = paste_progress(&[first.clone(), second.clone()], &destination, Op::Move, "copy", Some(&progress));
+        assert_eq!(report.done, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.retry.unwrap().sources, [first.clone(), second.clone()]);
+        assert!(first.exists() && second.exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+
+        // Cancelar a mitad de una copia descarta el temporal y no publica nada.
+        let progress = Progress::default();
+        let big = t.file("source/big", &"x".repeat(1024 * 1024));
+        progress.cancel();
+        let error = copy_with_progress(&big, &destination.join("big"), Some(&progress)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        progress.reset();
+        assert!(!progress.is_cancelled());
+        copy_with_progress(&big, &destination.join("big"), Some(&progress)).unwrap();
+        assert_eq!(progress.bytes.load(std::sync::atomic::Ordering::Relaxed), 1024 * 1024);
     }
 
     #[test]

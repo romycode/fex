@@ -273,6 +273,19 @@ pub struct Strings {
     pub undo: &'static str,
     pub nothing_to_undo: &'static str,
     pub undoing: &'static str,
+    pub go_to: &'static str,
+    pub s3_browse: &'static str,
+    pub palette: &'static str,
+    pub palette_placeholder: &'static str,
+    pub no_commands: &'static str,
+    pub cycle_theme: &'static str,
+    pub cycle_lang: &'static str,
+    pub quit: &'static str,
+    pub sort_name: &'static str,
+    pub sort_size: &'static str,
+    pub sort_date: &'static str,
+    pub cancel_job: &'static str,
+    pub cancelling: &'static str,
 }
 
 static ES: Strings = Strings {
@@ -311,9 +324,9 @@ static ES: Strings = Strings {
     cannot_open: "No se puede abrir",
     items: "elementos",
     hints: if cfg!(target_os = "macos") {
-        "⏎ abrir · ⌘⌫ papelera · F2 renombrar"
+        "⌘K comandos · ⏎ abrir · ⌘⌫ papelera · F2 renombrar"
     } else {
-        "⏎ abrir · ⌫ subir · F2 renombrar · Supr papelera · clic derecho: más"
+        "Ctrl+K comandos · ⏎ abrir · ⌫ subir · F2 renombrar · Supr papelera"
     },
     now: "Ahora",
     yesterday: "Ayer",
@@ -337,6 +350,19 @@ static ES: Strings = Strings {
     undo: "Deshacer",
     nothing_to_undo: "Nada que deshacer",
     undoing: "Deshaciendo…",
+    go_to: "Ir a una ruta",
+    s3_browse: "Explorar Amazon S3",
+    palette: "Paleta de comandos",
+    palette_placeholder: "Escribe un comando…",
+    no_commands: "Ningún comando coincide",
+    cycle_theme: "Cambiar tema",
+    cycle_lang: "Cambiar idioma",
+    quit: "Salir",
+    sort_name: "Ordenar por nombre",
+    sort_size: "Ordenar por tamaño",
+    sort_date: "Ordenar por fecha",
+    cancel_job: "Cancelar operación",
+    cancelling: "Cancelando…",
 };
 
 static CA: Strings = Strings {
@@ -375,9 +401,9 @@ static CA: Strings = Strings {
     cannot_open: "No es pot obrir",
     items: "elements",
     hints: if cfg!(target_os = "macos") {
-        "⏎ obrir · ⌘⌫ paperera · F2 reanomena"
+        "⌘K ordres · ⏎ obrir · ⌘⌫ paperera · F2 reanomena"
     } else {
-        "⏎ obrir · ⌫ pujar · F2 reanomena · Supr paperera · clic dret: més"
+        "Ctrl+K ordres · ⏎ obrir · ⌫ pujar · F2 reanomena · Supr paperera"
     },
     now: "Ara",
     yesterday: "Ahir",
@@ -401,6 +427,19 @@ static CA: Strings = Strings {
     undo: "Desfés",
     nothing_to_undo: "No hi ha res per desfer",
     undoing: "S'està desfent…",
+    go_to: "Ves a una ruta",
+    s3_browse: "Explora Amazon S3",
+    palette: "Paleta d’ordres",
+    palette_placeholder: "Escriu una ordre…",
+    no_commands: "Cap ordre coincideix",
+    cycle_theme: "Canvia el tema",
+    cycle_lang: "Canvia l’idioma",
+    quit: "Surt",
+    sort_name: "Ordena per nom",
+    sort_size: "Ordena per mida",
+    sort_date: "Ordena per data",
+    cancel_job: "Cancel·la l’operació",
+    cancelling: "S’està cancel·lant…",
 };
 
 static EN: Strings = Strings {
@@ -439,9 +478,9 @@ static EN: Strings = Strings {
     cannot_open: "Can't open",
     items: "items",
     hints: if cfg!(target_os = "macos") {
-        "⏎ open · ⌘⌫ trash · F2 rename"
+        "⌘K commands · ⏎ open · ⌘⌫ trash · F2 rename"
     } else {
-        "⏎ open · ⌫ up · F2 rename · Del trash · right-click: more"
+        "Ctrl+K commands · ⏎ open · ⌫ up · F2 rename · Del trash"
     },
     now: "Just now",
     yesterday: "Yesterday",
@@ -465,6 +504,19 @@ static EN: Strings = Strings {
     undo: "Undo",
     nothing_to_undo: "Nothing to undo",
     undoing: "Undoing…",
+    go_to: "Go to location",
+    s3_browse: "Browse Amazon S3",
+    palette: "Command palette",
+    palette_placeholder: "Type a command…",
+    no_commands: "No matching commands",
+    cycle_theme: "Change theme",
+    cycle_lang: "Change language",
+    quit: "Quit",
+    sort_name: "Sort by name",
+    sort_size: "Sort by size",
+    sort_date: "Sort by date",
+    cancel_job: "Cancel operation",
+    cancelling: "Cancelling…",
 };
 
 #[cfg(test)]

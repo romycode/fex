@@ -9,6 +9,7 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6`. Usa wgpu en Linux y Metal 
 
 ## Qué hace
 
+- **Paleta de comandos** (`Ctrl+K` / `⌘K`): busca y ejecuta cualquier acción disponible, con su atajo.
 - Lista virtualizada (`uniform_list`): solo se pintan las filas visibles, aguanta 100k+ entradas.
 - La ventana pinta primero y el listado llega después (`background_spawn`).
 - El listado no hace `stat`: usa `d_type` vía `file_type()`. Tamaño y fecha llegan en una segunda pasada en background.
@@ -27,7 +28,8 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6`. Usa wgpu en Linux y Metal 
   - conserva nombres no UTF-8, permisos, fecha de modificación y atributos extendidos de archivos y directorios.
   - al mover entre discos comprueba el origen antes de eliminarlo. Si el borrado falla, informa de la copia completa y de la ruta del origen.
   - muestra los bytes copiados y un resumen persistente de los errores. Permite reintentar los elementos fallidos cuyo destino sigue sin publicarse.
-  - procesa una operación de archivos cada vez y espera a que termine para permitir cerrar la ventana.
+  - procesa una operación de archivos cada vez, en un hilo propio, y espera a que termine para permitir cerrar la ventana.
+  - se puede cancelar desde el pie de la ventana o la paleta. Lo copiado a medias se descarta y lo pendiente queda para reintentar.
   - papelera del sistema mediante freedesktop en Linux y Foundation en macOS.
   - borrado permanente con confirmación. No sigue symlinks.
   - renombrado en línea: selecciona el nombre sin extensión, como Nautilus.
@@ -70,9 +72,14 @@ Atajos en Linux:
 | `Ctrl+L` | escribir una ruta (`Enter` abre, `Esc` cancela) |
 | clic derecho | menú contextual |
 | `Esc` | cerrar menú / quitar selección |
+| `Ctrl+K` / `Ctrl+Shift+P` | paleta de comandos |
 | `q` / `Ctrl+Q` | salir |
 
 En macOS usa `⌘` en los atajos con `Ctrl` y para alternar la selección con clic. Los archivos ocultos se alternan con `⇧⌘.`. Para mover a la papelera usa `⌘⌫`, y para el borrado permanente `⇧⌘⌫`.
+
+## Extender fex
+
+Cada acción es un comando declarado una vez en `src/app/commands.rs`: de ahí salen el atajo, el menú contextual, la barra de herramientas y la paleta. Cada backend declara sus capacidades en `src/backend.rs`, y lo que no soporta desaparece solo de la interfaz. Los detalles están en [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requisitos
 

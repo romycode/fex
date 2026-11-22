@@ -18,9 +18,45 @@ pub enum Location {
     S3(s3::Location),
 }
 
+/// Qué sabe hacer un backend. Los comandos consultan esto en vez de preguntar
+/// "¿es local?", así un backend nuevo solo declara lo que soporta.
+#[derive(Clone, Copy, Default)]
+pub struct Capabilities {
+    /// Copiar, mover, renombrar, borrar, crear carpetas y deshacer.
+    pub write: bool,
+    /// Abrir ficheros con la aplicación del sistema.
+    pub open_files: bool,
+    /// Descargar entradas a un directorio local.
+    pub download: bool,
+    /// Detectar cambios y refrescar solo.
+    pub watch: bool,
+    /// Tiene ficheros ocultos que alternar.
+    pub hidden_files: bool,
+    /// Rellenar tamaño y fecha en una segunda pasada.
+    pub stat_pass: bool,
+    /// Se puede fijar en la barra lateral.
+    pub pin: bool,
+}
+
 impl Location {
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local(_))
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        match self {
+            Self::Local(_) => Capabilities {
+                write: true,
+                open_files: true,
+                download: false,
+                watch: true,
+                hidden_files: true,
+                stat_pass: true,
+                pin: true,
+            },
+            Self::S3(s3::Location::Prefix { .. }) => Capabilities { download: true, ..Default::default() },
+            Self::S3(_) => Capabilities::default(),
+        }
     }
 
     pub async fn list(self, show_hidden: bool) -> io::Result<Vec<Entry>> {
