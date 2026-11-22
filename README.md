@@ -77,6 +77,19 @@ Atajos en Linux:
 
 En macOS usa `⌘` en los atajos con `Ctrl` y para alternar la selección con clic. Los archivos ocultos se alternan con `⇧⌘.`. Para mover a la papelera usa `⌘⌫`, y para el borrado permanente `⇧⌘⌫`.
 
+## Atajos personalizados
+
+Los atajos se cambian en un fichero de texto: `~/.config/fex/keymap` en Linux (respeta `XDG_CONFIG_HOME`) y `~/Library/Application Support/fex/keymap` en macOS. Lo más cómodo es abrirlo desde la paleta con **Editar atajos de teclado**: la primera vez se crea con todos los comandos comentados. También se puede ver la plantilla con `fex --list-commands`.
+
+```text
+# comando = atajo, atajo     (`mod` es Ctrl en Linux y ⌘ en macOS)
+file.new_folder = mod-n
+view.hidden     = linux:mod-h, mac:mod-shift-.
+app.quit        =            # sin atajo
+```
+
+Tus atajos sustituyen los del comando y ganan si chocan con los de otro. Las líneas con errores se ignoran y se avisa en la barra de estado. Tras guardar, usa **Recargar atajos de teclado** en la paleta.
+
 ## Extender fex
 
 Cada acción es un comando declarado una vez en `src/app/commands.rs`: de ahí salen el atajo, el menú contextual, la barra de herramientas y la paleta. Cada backend declara sus capacidades en `src/backend.rs`, y lo que no soporta desaparece solo de la interfaz. Los detalles están en [ARCHITECTURE.md](ARCHITECTURE.md).

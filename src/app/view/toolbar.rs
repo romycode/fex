@@ -161,7 +161,7 @@ impl Explorer {
             .rounded_md()
             .children(buttons)
             .child(
-                icon_button("theme", theme_icon, theme_label, theme.shortcut(self.lang), false, *t)
+                icon_button("theme", theme_icon, theme_label, self.shortcut(theme), false, *t)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| commands::run(this, theme, cx))),
             );
 

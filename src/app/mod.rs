@@ -8,6 +8,7 @@
 //! - [`jobs`]: trabajos en segundo plano, avisos y pila de deshacer.
 //! - [`view`]: pintado con GPUI.
 
+pub mod bindings;
 pub mod commands;
 mod file_ops;
 mod jobs;
@@ -137,6 +138,8 @@ pub struct Explorer {
     pub jobs: Jobs,
     pub mode: Mode,
     pub lang: Lang,
+    /// Atajos efectivos (por defecto + fichero `keymap` del usuario).
+    pub bindings: bindings::Bindings,
 
     watcher: Option<DirWatcher>,
     watch_tx: mpsc::UnboundedSender<()>,
@@ -225,6 +228,7 @@ impl Explorer {
             jobs: Jobs::default(),
             mode: Mode::System,
             lang: Lang::detect(),
+            bindings: bindings::Bindings::default(),
             watcher: None,
             watch_tx,
             focus: cx.focus_handle(),
@@ -237,6 +241,7 @@ impl Explorer {
             _appearance: appearance,
         };
         this.navigate(cwd, None, cx);
+        this.load_keymap(false, cx);
         this
     }
 
@@ -274,6 +279,85 @@ impl Explorer {
 
     pub fn is_busy(&self) -> bool {
         !self.jobs.busy.is_empty()
+    }
+
+    // ------------------------------------------------------------ atajos ----
+
+    /// Etiqueta del atajo efectivo de un comando ("" si no tiene).
+    pub fn shortcut(&self, command: &commands::Command) -> String {
+        self.bindings.label(command, self.lang)
+    }
+
+    /// Lee el keymap del usuario en background. Sin fichero = atajos por defecto.
+    fn load_keymap(&mut self, announce: bool, cx: &mut Context<Self>) {
+        let read = cx.background_spawn(async {
+            let path = crate::config::file(bindings::FILE_NAME)?;
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Ok(Some(text)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                let s = this.lang.t();
+                match result {
+                    Ok(text) => {
+                        let (bindings, errors) = bindings::Bindings::parse(text.as_deref().unwrap_or(""));
+                        this.bindings = bindings;
+                        if let Some(first) = errors.first() {
+                            let more = if errors.len() > 1 { this.lang.more_errors(errors.len() - 1) } else { String::new() };
+                            this.set_notice(jobs::Notice::Error(format!("{} {first}{more}", s.keymap_error)), cx);
+                        } else if announce {
+                            this.set_notice(jobs::Notice::Info(s.keymap_reloaded), cx);
+                        }
+                    }
+                    Err(error) => this.set_notice(jobs::Notice::Error(format!("{} {error}", s.keymap_error)), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn reload_keymap(&mut self, cx: &mut Context<Self>) {
+        self.load_keymap(true, cx);
+    }
+
+    /// Abre el keymap en el editor del sistema; la primera vez lo crea con la plantilla.
+    pub fn edit_keymap(&mut self, cx: &mut Context<Self>) {
+        let template = bindings::template(self.lang);
+        let task = cx.background_spawn(async move {
+            let path = crate::config::file(bindings::FILE_NAME)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => std::io::Write::write_all(&mut file, template.as_bytes())?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            Ok(path)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(path) => {
+                    this.set_notice(jobs::Notice::Info(this.lang.t().keymap_hint), cx);
+                    std::thread::spawn(move || {
+                        let _ = std::process::Command::new(Platform::CURRENT.opener()).arg(path).status();
+                    });
+                }
+                Err(error) => {
+                    let message = format!("{} {error}", this.lang.t().keymap_error);
+                    this.set_notice(jobs::Notice::Error(message), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ------------------------------------------------------- preferencias ----

@@ -257,3 +257,40 @@ fn commands_drive_keyboard_palette_and_menus() {
     wait_for_jobs(&mut app, handle);
     handle.update(&mut app, |e, _, _| assert!(!e.jobs.progress.is_cancelled() || !e.is_busy())).unwrap();
 }
+
+#[test]
+fn user_keymap_overrides_defaults_end_to_end() {
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config.path().join(crate::app::bindings::FILE_NAME),
+        "file.new_folder = n\nview.theme =\nbogus.command = x\n",
+    )
+    .unwrap();
+    // Solo este test lee el keymap; los pins también van al directorio temporal.
+    unsafe { std::env::set_var("FEX_CONFIG_DIR", config.path()) };
+    let folder = tempfile::tempdir().unwrap();
+    let mut app = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    let handle = open(&mut app, folder.path().to_path_buf());
+    handle.update(&mut app, |e, _, _| {
+        let new_folder = crate::app::commands::find("file.new_folder");
+        e.lang = crate::i18n::Lang::En;
+        assert_eq!(e.shortcut(new_folder), "N");
+        assert_eq!(e.shortcut(crate::app::commands::find("view.theme")), "");
+    }).unwrap();
+    let mode = handle.update(&mut app, |e, _, _| e.mode).unwrap();
+    app.update_window(handle.into(), |_, window, cx| {
+        key(window, cx, "t");
+        key(window, cx, "n");
+    })
+    .unwrap();
+    app.run_until_parked();
+    handle.update(&mut app, |e, _, _| {
+        assert!(e.mode == mode, "`t` ya no cambia el tema");
+        assert!(matches!(e.modal, Modal::Rename(_)));
+    }).unwrap();
+    assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1, "`n` crea la carpeta");
+}

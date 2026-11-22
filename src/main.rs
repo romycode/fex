@@ -12,6 +12,7 @@
 
 mod app;
 mod backend;
+mod config;
 mod fs;
 mod i18n;
 mod icons;
@@ -87,6 +88,14 @@ fn main() {
     for a in std::env::args_os().skip(1) {
         match a.to_str().unwrap_or("") {
             "--bench" => bench_mode = true,
+            "--list-commands" => {
+                // Plantilla del fichero `keymap`: todos los comandos con sus atajos por defecto.
+                if let Ok(path) = config::file(app::bindings::FILE_NAME) {
+                    println!("# {}", path.display());
+                }
+                print!("{}", app::bindings::template(Lang::detect()));
+                return;
+            }
             "--exit-after-first-frame" => exit_after_first_frame = true,
             "--light" => forced_mode = Some(Mode::Light),
             "--dark" => forced_mode = Some(Mode::Dark),

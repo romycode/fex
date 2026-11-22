@@ -9,12 +9,14 @@ main.rs            arranque: argumentos, ventana, --bench
 app/               aplicación (GPUI)
   mod.rs           estado (Explorer), Modal, teclado
   commands.rs      registro de comandos  ← punto de extensión principal
+  bindings.rs      atajos efectivos: por defecto + keymap del usuario
   selection.rs     cursor y selección múltiple (puro, testeado)
   navigation.rs    listar, refrescar, ordenar, rutas, S3
   file_ops.rs      copiar, pegar, papelera, renombrar, carpetas
   jobs.rs          trabajos en segundo plano, avisos, deshacer
   view/            solo render: sidebar, toolbar, list, overlays, status
-keymap.rs          atajos como datos ("mod-shift-n")
+keymap.rs          atajos como datos ("mod-shift-n") y diferencias Linux/macOS
+config.rs          directorio de configuración por plataforma
 backend.rs         Location + Capabilities  ← punto de extensión de backends
 fs.rs ops.rs safe_fs.rs undo.rs watch.rs sidebar.rs s3.rs
                    dominio puro, sin GPUI, con tests propios
@@ -46,6 +48,8 @@ Con eso el comando:
 - aparece en la paleta (`Ctrl+K` / `⌘K`) con su atajo,
 - se puede poner en un menú añadiendo `Cmd("file.duplicate")` a `ITEM_MENU` o `BACKGROUND_MENU`,
 - se puede poner en la barra añadiendo su id a `TOOLBAR` en `view/toolbar.rs`.
+
+Los usuarios pueden cambiar cualquier atajo sin recompilar con el fichero `keymap` (ver `app/bindings.rs` y el README); por eso los ids de comando son estables y forman parte de la API pública.
 
 Las etiquetas de atajo en menús, tooltips y paleta salen de la misma cadena que casa la tecla, así que no se desincronizan.
 

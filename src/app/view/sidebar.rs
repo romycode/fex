@@ -86,7 +86,7 @@ impl Explorer {
                 "pin-current",
                 Icon::Pin,
                 if pinned { s.unpin_folder } else { s.pin_folder },
-                pin.shortcut(self.lang),
+                self.shortcut(pin),
                 pinned,
                 *t,
             )

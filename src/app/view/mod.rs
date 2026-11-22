@@ -99,7 +99,7 @@ impl Explorer {
             id,
             command.icon.unwrap_or(Icon::Unknown),
             (command.label)(self.lang.t()),
-            command.shortcut(self.lang),
+            self.shortcut(command),
             checked,
             *t,
         )

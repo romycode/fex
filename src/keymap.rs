@@ -177,13 +177,6 @@ pub fn matches_any_on(specs: &[&str], keystroke: &Keystroke, platform: Platform)
     specs.iter().filter_map(|spec| Chord::parse(spec, platform)).any(|chord| chord.matches(keystroke, platform))
 }
 
-pub fn shortcut_label(specs: &[&str], lang: Lang) -> String {
-    shortcut_label_on(specs, lang, Platform::CURRENT)
-}
-
-pub fn matches_any(specs: &[&str], keystroke: &Keystroke) -> bool {
-    matches_any_on(specs, keystroke, Platform::CURRENT)
-}
 
 #[cfg(test)]
 mod tests {

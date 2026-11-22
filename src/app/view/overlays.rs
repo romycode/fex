@@ -87,7 +87,7 @@ impl Explorer {
                             .whitespace_nowrap()
                             .text_xs()
                             .text_color(t.faint)
-                            .child(SharedString::from(command.shortcut(self.lang))),
+                            .child(SharedString::from(self.shortcut(command))),
                     )
                     .into_any_element()
             }
@@ -261,7 +261,7 @@ impl Explorer {
                         .text_xs()
                         .text_color(t.faint)
                         .whitespace_nowrap()
-                        .child(SharedString::from(command.shortcut(self.lang))),
+                        .child(SharedString::from(self.shortcut(command))),
                 )
         });
 

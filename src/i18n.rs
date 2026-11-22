@@ -286,6 +286,11 @@ pub struct Strings {
     pub sort_date: &'static str,
     pub cancel_job: &'static str,
     pub cancelling: &'static str,
+    pub edit_keymap: &'static str,
+    pub reload_keymap: &'static str,
+    pub keymap_error: &'static str,
+    pub keymap_reloaded: &'static str,
+    pub keymap_hint: &'static str,
 }
 
 static ES: Strings = Strings {
@@ -363,6 +368,11 @@ static ES: Strings = Strings {
     sort_date: "Ordenar por fecha",
     cancel_job: "Cancelar operación",
     cancelling: "Cancelando…",
+    edit_keymap: "Editar atajos de teclado",
+    reload_keymap: "Recargar atajos de teclado",
+    keymap_error: "Atajos:",
+    keymap_reloaded: "Atajos recargados",
+    keymap_hint: "Guarda el fichero y usa «Recargar atajos»",
 };
 
 static CA: Strings = Strings {
@@ -440,6 +450,11 @@ static CA: Strings = Strings {
     sort_date: "Ordena per data",
     cancel_job: "Cancel·la l’operació",
     cancelling: "S’està cancel·lant…",
+    edit_keymap: "Edita les dreceres de teclat",
+    reload_keymap: "Recarrega les dreceres de teclat",
+    keymap_error: "Dreceres:",
+    keymap_reloaded: "Dreceres recarregades",
+    keymap_hint: "Desa el fitxer i fes servir «Recarrega les dreceres»",
 };
 
 static EN: Strings = Strings {
@@ -517,6 +532,11 @@ static EN: Strings = Strings {
     sort_date: "Sort by date",
     cancel_job: "Cancel operation",
     cancelling: "Cancelling…",
+    edit_keymap: "Edit keyboard shortcuts",
+    reload_keymap: "Reload keyboard shortcuts",
+    keymap_error: "Shortcuts:",
+    keymap_reloaded: "Shortcuts reloaded",
+    keymap_hint: "Save the file and use “Reload keyboard shortcuts”",
 };
 
 #[cfg(test)]

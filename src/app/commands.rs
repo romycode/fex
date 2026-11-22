@@ -14,9 +14,8 @@ use gpui::Context;
 use super::Explorer;
 use crate::{
     fs::SortColumn,
-    i18n::{Lang, Strings},
+    i18n::Strings,
     icons::Icon,
-    keymap,
     ops::Op,
 };
 
@@ -40,10 +39,6 @@ pub struct Command {
 }
 
 impl Command {
-    pub fn shortcut(&self, lang: Lang) -> String {
-        keymap::shortcut_label(self.keys, lang)
-    }
-
     pub fn is_checked(&self, explorer: &Explorer) -> bool {
         self.checked.is_some_and(|checked| checked(explorer))
     }
@@ -133,6 +128,8 @@ pub static COMMANDS: &[Command] = &[
     cmd("view.theme", |s| s.cycle_theme, |e, cx| e.cycle_theme(cx)).icon(Icon::Contrast).keys(&["t"]),
     cmd("view.lang", |s| s.cycle_lang, |e, cx| e.cycle_lang(cx)).icon(Icon::Globe).keys(&["i"]),
     cmd("app.palette", |s| s.palette, |e, cx| e.open_palette(cx)).keys(&["mod-k", "mod-shift-p"]).hidden(),
+    cmd("app.edit_keymap", |s| s.edit_keymap, |e, cx| e.edit_keymap(cx)).icon(Icon::Pencil),
+    cmd("app.reload_keymap", |s| s.reload_keymap, |e, cx| e.reload_keymap(cx)).icon(Icon::Refresh),
     cmd("app.quit", |s| s.quit, |_, cx| cx.quit()).keys(&["mod-q", "q"]).when(|e| e.jobs.busy.is_empty()),
     // -------------------------------------------------------------- selección
     cmd("cursor.down", no_label, |e, cx| e.move_cursor(1, false, cx)).keys(&["down", "j"]).hidden(),
@@ -261,9 +258,7 @@ pub fn resolve_menu(items: &[MenuItem], explorer: &Explorer) -> Vec<Option<&'sta
 
 /// Ejecuta el primer comando disponible cuyo atajo case con la pulsación.
 pub fn dispatch(explorer: &mut Explorer, keystroke: &gpui::Keystroke, cx: &mut Context<Explorer>) -> bool {
-    let Some(command) =
-        COMMANDS.iter().find(|c| keymap::matches_any(c.keys, keystroke) && (c.when)(&*explorer))
-    else {
+    let Some(command) = explorer.bindings.find(explorer, keystroke) else {
         return false;
     };
     run(explorer, command, cx);
@@ -296,6 +291,7 @@ pub fn fuzzy_score(label: &str, query: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{i18n::Lang, keymap};
     use std::collections::HashSet;
 
     #[test]
