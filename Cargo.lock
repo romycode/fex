@@ -2055,6 +2055,7 @@ version = "0.2.0-beta.1"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
  "futures",
  "gpui",
  "gpui_platform",

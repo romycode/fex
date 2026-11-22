@@ -9,6 +9,7 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6`. Usa wgpu en Linux y Metal 
 
 ## Qué hace
 
+- **Paleta de comandos** (`Ctrl+K` / `⌘K`): busca y ejecuta cualquier acción disponible, con su atajo.
 - Lista virtualizada (`uniform_list`): solo se pintan las filas visibles, aguanta 100k+ entradas.
 - La ventana pinta primero y el listado llega después (`background_spawn`).
 - El listado no hace `stat`: usa `d_type` vía `file_type()`. Tamaño y fecha llegan en una segunda pasada en background.
@@ -27,7 +28,8 @@ GPUI viene de Zed `main`, fijado al commit `d2a4fb6`. Usa wgpu en Linux y Metal 
   - conserva nombres no UTF-8, permisos, fecha de modificación y atributos extendidos de archivos y directorios.
   - al mover entre discos comprueba el origen antes de eliminarlo. Si el borrado falla, informa de la copia completa y de la ruta del origen.
   - muestra los bytes copiados y un resumen persistente de los errores. Permite reintentar los elementos fallidos cuyo destino sigue sin publicarse.
-  - procesa una operación de archivos cada vez y espera a que termine para permitir cerrar la ventana.
+  - procesa una operación de archivos cada vez, en un hilo propio, y espera a que termine para permitir cerrar la ventana.
+  - se puede cancelar desde el pie de la ventana o la paleta. Lo copiado a medias se descarta y lo pendiente queda para reintentar.
   - papelera del sistema mediante freedesktop en Linux y Foundation en macOS.
   - borrado permanente con confirmación. No sigue symlinks.
   - renombrado en línea: selecciona el nombre sin extensión, como Nautilus.
@@ -70,9 +72,77 @@ Atajos en Linux:
 | `Ctrl+L` | escribir una ruta (`Enter` abre, `Esc` cancela) |
 | clic derecho | menú contextual |
 | `Esc` | cerrar menú / quitar selección |
+| `Ctrl+K` / `Ctrl+Shift+P` | paleta de comandos |
 | `q` / `Ctrl+Q` | salir |
 
 En macOS usa `⌘` en los atajos con `Ctrl` y para alternar la selección con clic. Los archivos ocultos se alternan con `⇧⌘.`. Para mover a la papelera usa `⌘⌫`, y para el borrado permanente `⇧⌘⌫`.
+
+## Amazon S3
+
+### Conexiones
+
+La sección **Amazon S3** de la barra lateral lista las conexiones guardadas. `+` añade una y el lápiz la edita. Cada conexión elige sus credenciales:
+
+- **del sistema**: la cadena estándar de AWS (variables de entorno, `~/.aws/credentials`, SSO…), con un perfil opcional. Es la conexión `AWS` que existe por defecto.
+- **claves propias**: access key, secret key y, si hace falta, session token.
+
+Y, como opciones de cualquier conexión:
+
+- **host (endpoint)**: un servidor compatible con S3 (el emulador oficial de AWS, MinIO, R2…). Vacío = AWS.
+- **región**: si no se indica, la del perfil o `us-east-1`.
+- **rutas path-style** (`host/bucket/clave`): necesarias en casi todos los servidores compatibles y cuando el host es una IP.
+- **certificado CA**: un PEM adicional en el que confiar, para servidores con certificado propio.
+
+Se guardan en `~/.config/fex/s3` (Linux) o `~/Library/Application Support/fex/s3` (macOS), con permisos `0600` porque pueden llevar claves. También se puede editar a mano:
+
+```text
+[AWS]
+profile = default
+
+[Emulador]
+endpoint = https://127.0.0.1:9297
+region = us-east-1
+access_key = AKIA…
+secret_key = …
+path_style = true
+ca_file = ~/ruta/al/ca.pem
+```
+
+### Operaciones
+
+Dentro de un bucket funcionan las mismas acciones que en local:
+
+- **copiar, cortar y pegar** entre local y S3 en cualquier sentido, y entre buckets del mismo perfil (copia servidor a servidor, sin pasar por tu máquina). Las carpetas se copian enteras.
+- **renombrar, nueva carpeta y borrar.** S3 no tiene papelera: `Supr` pide confirmación y borra de forma permanente.
+- **descargar** (`Ctrl+D` / `⌘D`) ficheros o carpetas a una carpeta local elegida.
+- **deshacer** copias, movimientos dentro de S3, renombrados y carpetas nuevas. Mover entre local y S3 no se puede deshacer.
+- **cancelar** desde el pie de la ventana, como en local.
+
+Garantías, iguales que en local:
+
+- **Nunca sobrescribe.** Las escrituras usan `If-None-Match: *`: si el destino ya existe, S3 las rechaza y fex elige otro nombre ("x (2).txt").
+- **Nunca borra ni mueve algo que haya cambiado.** Los borrados y las copias de origen usan el ETag leído (`If-Match`). Si otro proceso modificó el objeto entretanto, la operación se detiene y lo avisa.
+- **Sin carpetas a medias.** Si falla a mitad de una carpeta, se borra lo que ya se había copiado de ella. Las descargas se montan en un temporal y se publican enteras.
+- Los ficheros grandes se suben por partes (subida multiparte) y las copias de más de 5 GB también.
+
+Permisos IAM necesarios: `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` y `s3:AbortMultipartUpload`. Los servicios compatibles con S3 (MinIO, R2…) deben admitir escrituras condicionales (`If-None-Match`); si no, las escrituras fallan en vez de sobrescribir.
+
+## Atajos personalizados
+
+Los atajos se cambian en un fichero de texto: `~/.config/fex/keymap` en Linux (respeta `XDG_CONFIG_HOME`) y `~/Library/Application Support/fex/keymap` en macOS. Lo más cómodo es abrirlo desde la paleta con **Editar atajos de teclado**: la primera vez se crea con todos los comandos comentados. También se puede ver la plantilla con `fex --list-commands`.
+
+```text
+# comando = atajo, atajo     (`mod` es Ctrl en Linux y ⌘ en macOS)
+file.new_folder = mod-n
+view.hidden     = linux:mod-h, mac:mod-shift-.
+app.quit        =            # sin atajo
+```
+
+Tus atajos sustituyen los del comando y ganan si chocan con los de otro. Las líneas con errores se ignoran y se avisa en la barra de estado. Tras guardar, usa **Recargar atajos de teclado** en la paleta.
+
+## Extender fex
+
+Cada acción es un comando declarado una vez en `src/app/commands.rs`: de ahí salen el atajo, el menú contextual, la barra de herramientas y la paleta. Cada backend declara sus capacidades en `src/backend.rs`, y lo que no soporta desaparece solo de la interfaz. Los detalles están en [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Requisitos
 
@@ -154,7 +224,28 @@ Lo que debes mirar:
 cargo test --release
 ```
 
-Los tests unitarios cubren las operaciones de ficheros, el deshacer, los formatos de portapapeles, la edición de texto UTF-8, i18n, la detección de discos y la persistencia de carpetas fijadas.
+Los tests unitarios cubren las operaciones de ficheros, el deshacer, los formatos de portapapeles, la edición de texto UTF-8, i18n, la detección de discos y la persistencia de carpetas fijadas. Las escrituras en S3 se prueban contra un S3 falso en memoria (`src/s3/fake.rs`).
+
+### S3 contra el emulador oficial de AWS
+
+Hay un test de integración contra el [emulador oficial de AWS](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html) (`aws-emulator`). No corre por defecto. Comprueba de punta a punta:
+
+- TLS con la CA del emulador y path-style;
+- claves propias y credenciales del sistema;
+- subida multiparte de 20 MiB y que nunca se sobrescribe (`If-None-Match`);
+- copiar, mover, renombrar, deshacer y descargar carpetas;
+- borrados condicionales (`If-Match`).
+
+```sh
+# Instalar (Debian/Ubuntu; hay RPM y arm64 en la guía) y arrancar sin telemetría
+curl -fsSLo aws-emulator.deb https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+sudo apt-get install -y ./aws-emulator.deb
+EMULATOR_TELEMETRY=off aws-emulator &
+
+cargo test -- --ignored emulador
+```
+
+Lee el endpoint, las claves y la CA de `~/.aws/emulator/9297/` (otro directorio con `FEX_S3_EMULATOR_DIR`). Para usar el emulador desde fex, crea una conexión con esos mismos datos: host `https://127.0.0.1:9297`, región `us-east-1`, las claves de `emulator_credentials`, path-style activado y el certificado `ca.pem`.
 
 ## Límites del POC
 
@@ -164,7 +255,8 @@ No incluye todavía:
 - miniaturas
 - rehacer (Ctrl+Shift+Z) y vista de la papelera
 - diálogo de conflictos: ahora siempre se renombra automáticamente
-- porcentaje total y cancelación de copias (ya se muestran bytes copiados)
+- porcentaje total de las copias (ya se muestran bytes copiados y se pueden cancelar)
+- copiar entre conexiones S3 distintas
 - el campo de renombrado no soporta IME ni selección con ratón
 - DnD
 - pestañas

@@ -6,21 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(target_os = "linux")]
 fn pins_file() -> io::Result<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_CONFIG_HOME / HOME"))?;
-    Ok(config.join("fex/pins"))
-}
-
-#[cfg(target_os = "macos")]
-fn pins_file() -> io::Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/fex/pins"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME"))
+    crate::config::file("pins")
 }
 
 fn read_pins(file: &Path) -> io::Result<Vec<PathBuf>> {
