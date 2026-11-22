@@ -304,8 +304,10 @@ mod tests {
         for command in COMMANDS {
             assert!(seen.insert(command.id), "id repetido: {}", command.id);
             for spec in command.keys {
-                let bare = spec.trim_start_matches("linux:").trim_start_matches("mac:");
-                assert!(keymap::Chord::parse(bare).is_some(), "atajo inválido en {}: {spec}", command.id);
+                let valid = [keymap::Platform::Linux, keymap::Platform::Mac]
+                    .into_iter()
+                    .any(|platform| keymap::Chord::parse(spec, platform).is_some());
+                assert!(valid, "atajo inválido en {}: {spec}", command.id);
             }
         }
         for item in ITEM_MENU.iter().chain(BACKGROUND_MENU) {
@@ -313,6 +315,43 @@ mod tests {
                 assert!(seen.contains(id), "el menú usa un comando desconocido: {id}");
             }
         }
+    }
+
+    /// En cada plataforma, un atajo solo se comparte a propósito (con `when` excluyentes) y
+    /// ningún comando con atajo se queda sin él en una de las dos.
+    #[test]
+    fn shortcuts_are_consistent_on_linux_and_macos() {
+        use keymap::{Chord, Platform};
+        // Atajos compartidos a propósito: local vs. S3.
+        const SHARED: &[&str] = &["mod-d", "mod-l"];
+        for platform in [Platform::Linux, Platform::Mac] {
+            let mut owners: std::collections::HashMap<Chord, Vec<&str>> = Default::default();
+            for command in COMMANDS {
+                let chords: Vec<_> = command.keys.iter().filter_map(|spec| Chord::parse(spec, platform)).collect();
+                assert!(
+                    command.keys.is_empty() || !chords.is_empty(),
+                    "{} no tiene atajo en {platform:?}",
+                    command.id
+                );
+                for chord in chords {
+                    owners.entry(chord).or_default().push(command.id);
+                }
+            }
+            for (chord, ids) in owners {
+                let spec = command_spec(&chord);
+                assert!(ids.len() == 1 || SHARED.contains(&spec.as_str()), "{spec} repetido en {platform:?}: {ids:?}");
+            }
+        }
+    }
+
+    fn command_spec(chord: &keymap::Chord) -> String {
+        let mut spec = String::new();
+        for (on, name) in [(chord.command, "mod-"), (chord.ctrl, "ctrl-"), (chord.alt, "alt-"), (chord.shift, "shift-")] {
+            if on {
+                spec.push_str(name);
+            }
+        }
+        spec + chord.key
     }
 
     #[test]

@@ -245,8 +245,7 @@ impl Explorer {
             let path = self.cwd.join(&entry.name);
             // En un hilo aparte para recoger el proceso (sin zombis) y no bloquear.
             std::thread::spawn(move || {
-                let opener = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
-                let _ = std::process::Command::new(opener).arg(path).status();
+                let _ = std::process::Command::new(crate::keymap::Platform::CURRENT.opener()).arg(path).status();
             });
         }
     }

@@ -30,6 +30,7 @@ use crate::{
     fs::{self, Entry, Place, SortColumn},
     i18n::Lang,
     input::{InputResult, LineInput},
+    keymap::Platform,
     ops::Op,
     sidebar,
     theme::Mode,
@@ -347,7 +348,7 @@ impl Explorer {
             self.commit_rename(cx);
         }
         let m = ev.modifiers();
-        if if cfg!(target_os = "macos") { m.platform } else { m.control } {
+        if Platform::CURRENT.toggle_click(&m) {
             self.selection.toggle(ix, &self.entries);
         } else if m.shift {
             self.selection.extend_to(ix, &self.entries);
@@ -423,7 +424,7 @@ impl Explorer {
         let k = &ev.keystroke;
         let m = &k.modifiers;
         let key = k.key.as_str();
-        let command = if cfg!(target_os = "macos") { m.platform } else { m.control && !m.platform };
+        let command = Platform::CURRENT.command(m);
         let ch = k.key_char.as_deref();
 
         // Lo modal captura el teclado antes que los comandos.
