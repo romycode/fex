@@ -1026,4 +1026,181 @@ mod tests {
         assert_eq!(fake.get("other", "c.txt").unwrap(), b"c");
         assert!(!c.exists(), "el origen local se borra tras subirlo");
     }
+
+    /// Contra el emulador oficial de AWS (`aws-emulator`, HTTPS en 127.0.0.1:9297 con su CA).
+    /// Ejecutar con el emulador en marcha: `cargo test -- --ignored emulador`.
+    /// `FEX_S3_EMULATOR_DIR` cambia el directorio de sus ficheros (por defecto ~/.aws/emulator/9297).
+    #[test]
+    #[ignore = "necesita el emulador oficial de AWS en marcha"]
+    fn emulador_oficial_de_aws() {
+        use crate::{
+            backend::{self, Item, Location as Place},
+            s3::connection::{Connection, Credentials},
+        };
+        let dir = std::env::var_os("FEX_S3_EMULATOR_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".aws/emulator/9297"));
+        let ini = |file: &str, key: &str| -> String {
+            let text = std::fs::read_to_string(dir.join(file)).expect("¿está el emulador en marcha?");
+            text.lines()
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim() == key)
+                .map(|(_, v)| v.trim().to_owned())
+                .unwrap_or_else(|| panic!("falta {key} en {file}"))
+        };
+        let connection = Connection {
+            name: "emulador".into(),
+            credentials: Credentials::Keys {
+                access_key: ini("emulator_credentials", "aws_access_key_id"),
+                secret_key: ini("emulator_credentials", "aws_secret_access_key"),
+                session_token: None,
+            },
+            endpoint: Some(ini("config", "endpoint_url")),
+            region: Some(ini("config", "region")),
+            path_style: true,
+            ca_file: Some(PathBuf::from(ini("config", "ca_bundle"))),
+        };
+        super::super::set_connections(vec![connection]);
+        let service = super::super::service().unwrap();
+        let bucket = format!("fex-test-{}", std::process::id());
+        let at = |key: &str| Object { connection: "emulador".into(), bucket: bucket.clone(), key: key.into() };
+        let keys = |prefix: &str| -> Vec<String> {
+            service.runtime.block_on(async {
+                let client = service.bucket_client("emulador", &bucket).await.unwrap();
+                list_tree(&client, &at(prefix)).await.unwrap().into_iter().map(|o| o.key).collect()
+            })
+        };
+        let read = |key: &str| -> Vec<u8> {
+            service.runtime.block_on(async {
+                let client = service.bucket_client("emulador", &bucket).await.unwrap();
+                let out = client.get_object().bucket(&bucket).key(key).send().await.unwrap();
+                out.body.collect().await.unwrap().into_bytes().to_vec()
+            })
+        };
+
+        // TLS con la CA del emulador, claves propias y path-style: crear y listar buckets.
+        service.runtime.block_on(async {
+            let client = service.client("emulador", None).await.unwrap();
+            client.create_bucket().bucket(&bucket).send().await.expect("crear bucket");
+        });
+        let buckets = futures::executor::block_on(super::super::list(super::super::Location::Buckets { connection: "emulador".into() })).unwrap();
+        assert!(buckets.iter().any(|e| e.name == bucket.as_str()), "el bucket aparece en el listado");
+
+        // Subir: fichero, carpeta y uno de 20 MiB (subida multiparte).
+        let local = tempfile::tempdir().unwrap();
+        let a = local.path().join("a.txt");
+        std::fs::write(&a, "hola").unwrap();
+        let d = local.path().join("d");
+        std::fs::create_dir_all(d.join("vacía")).unwrap();
+        std::fs::write(d.join("x.txt"), "equis").unwrap();
+        let big = local.path().join("grande.bin");
+        let big_data: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&big, &big_data).unwrap();
+        let progress = Progress::default();
+        let r = futures::executor::block_on(upload(vec![a.clone(), d.clone(), big.clone()], at(""), Op::Copy, progress.clone()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(keys(""), ["a.txt", "d/", "d/vacía/", "d/x.txt", "grande.bin"]);
+        assert_eq!(read("grande.bin"), big_data, "la subida multiparte reconstruye el fichero");
+        assert!(progress.bytes.load(std::sync::atomic::Ordering::Relaxed) >= big_data.len() as u64);
+
+        // Nombres ocupados: nunca se sobrescribe.
+        let r = futures::executor::block_on(upload(vec![a.clone()], at(""), Op::Copy, Progress::default()));
+        assert_eq!(r.created, ["a (2).txt"]);
+        let clash = service.runtime.block_on(async {
+            let client = service.bucket_client("emulador", &bucket).await.unwrap();
+            put_bytes(&client, &bucket, "a.txt", b"pisado".to_vec()).await
+        });
+        assert_eq!(clash.unwrap_err().kind(), io::ErrorKind::AlreadyExists, "el emulador respeta If-None-Match");
+        assert_eq!(read("a.txt"), b"hola");
+
+        // Copiar en el sitio, mover una carpeta y deshacerlo.
+        let r = futures::executor::block_on(copy(vec![at("a.txt")], at(""), Op::Copy, "copia", Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read("a (copia).txt"), b"hola");
+        let r = futures::executor::block_on(copy(vec![at("d/")], at("otro/"), Op::Move, "copia", Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(keys("d/").is_empty());
+        assert_eq!(keys("otro/"), ["otro/d/", "otro/d/vacía/", "otro/d/x.txt"]);
+        let r = futures::executor::block_on(revert(Change::Moved(r.s3_moved)));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(keys("d/"), ["d/", "d/vacía/", "d/x.txt"]);
+        assert!(keys("otro/").is_empty());
+
+        // Renombrar; a un nombre ocupado, no.
+        let r = futures::executor::block_on(rename(at("a.txt"), "b.txt".into()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let r = futures::executor::block_on(rename(at("b.txt"), "a (2).txt".into()));
+        assert!(matches!(r.errors[..], [OpError::Exists(_)]));
+
+        // Un borrado con un ETag que no corresponde se rechaza.
+        let stale = service.runtime.block_on(async {
+            let client = service.bucket_client("emulador", &bucket).await.unwrap();
+            delete_object(&client, &bucket, "b.txt", "\"00000000000000000000000000000000\"").await
+        });
+        assert!(stale.is_err(), "el emulador respeta If-Match en DeleteObject");
+        assert_eq!(read("b.txt"), b"hola");
+
+        // Carpeta nueva, descarga de carpetas y del fichero grande.
+        let r = futures::executor::block_on(mkdir(at(""), "Nueva carpeta"));
+        assert_eq!(r.created, ["Nueva carpeta/"]);
+        let downloads = tempfile::tempdir().unwrap();
+        let r = futures::executor::block_on(download(vec![at("d/"), at("grande.bin")], downloads.path().into(), Op::Copy, Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(std::fs::read_to_string(downloads.path().join("d/x.txt")).unwrap(), "equis");
+        assert!(downloads.path().join("d/vacía").is_dir());
+        assert_eq!(std::fs::read(downloads.path().join("grande.bin")).unwrap(), big_data);
+
+        // Capa común: mover S3 → local y local → S3.
+        let r = futures::executor::block_on(backend::paste(vec![Item::S3(at("b.txt"))], Place::Local(downloads.path().into()), Op::Move, "copia", Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(!keys("").contains(&"b.txt".to_owned()), "mover borra el origen en S3");
+        let target = Place::S3(super::super::Location::Prefix { connection: "emulador".into(), bucket: bucket.clone(), prefix: "subido/".into() });
+        let r = futures::executor::block_on(backend::paste(vec![Item::Local(downloads.path().join("b.txt"))], target, Op::Move, "copia", Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(read("subido/b.txt"), b"hola");
+        assert!(!downloads.path().join("b.txt").exists());
+
+        // Credenciales del sistema: lo que recomienda la guía del emulador (AWS_CONFIG_FILE y
+        // AWS_SHARED_CREDENTIALS_FILE). El endpoint sale del fichero de config; la CA, de la conexión.
+        // Las variables de claves tienen prioridad en la cadena de AWS: fuera, como en un equipo limpio.
+        unsafe {
+            for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"] {
+                std::env::remove_var(var);
+            }
+            std::env::set_var("AWS_CONFIG_FILE", dir.join("config"));
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", dir.join("emulator_credentials"));
+        }
+        let system = Connection {
+            name: "sistema".into(),
+            credentials: Credentials::System { profile: None },
+            endpoint: None,
+            region: None,
+            path_style: true,
+            ca_file: Some(PathBuf::from(ini("config", "ca_bundle"))),
+        };
+        let mut both = vec![system];
+        both.extend(crate::s3::find_connection("emulador"));
+        super::super::set_connections(both);
+        let listed = futures::executor::block_on(super::super::list(super::super::Location::Prefix {
+            connection: "sistema".into(),
+            bucket: bucket.clone(),
+            prefix: String::new(),
+        }))
+        .expect("listar con las credenciales del sistema");
+        assert!(listed.iter().any(|e| e.name == "grande.bin"));
+
+        // Limpiar: borrar todo y el bucket.
+        // Lo de primer nivel: ficheros sueltos y carpetas (tengan marcador o no).
+        let mut top: Vec<String> =
+            keys("").iter().map(|k| k.split_once('/').map_or(k.clone(), |(dir, _)| format!("{dir}/"))).collect();
+        top.dedup();
+        let everything: Vec<_> = top.iter().map(|k| at(k)).collect();
+        let r = futures::executor::block_on(delete(everything, Progress::default()));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(keys("").is_empty());
+        service.runtime.block_on(async {
+            let client = service.client("emulador", None).await.unwrap();
+            client.delete_bucket().bucket(&bucket).send().await.expect("borrar bucket");
+        });
+    }
 }

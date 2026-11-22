@@ -230,7 +230,8 @@ fn handle(request: &Request, state: &mut State) -> Response {
 fn list(request: &Request, state: &State, bucket: &str) -> Response {
     let prefix = request.param("prefix").unwrap_or("");
     let delimiter = request.param("delimiter");
-    let encode = |key: &str| utf8_percent_encode(key, KEY).to_string();
+    // Como S3 con encoding-type=url: estilo formulario, el espacio va como `+`.
+    let encode = |key: &str| utf8_percent_encode(key, KEY).to_string().replace("%20", "+");
     let mut contents = String::new();
     let mut prefixes = Vec::<String>::new();
     for ((b, key), (body, etag)) in &state.objects {

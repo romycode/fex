@@ -224,7 +224,28 @@ Lo que debes mirar:
 cargo test --release
 ```
 
-Los tests unitarios cubren las operaciones de ficheros, el deshacer, los formatos de portapapeles, la edición de texto UTF-8, i18n, la detección de discos y la persistencia de carpetas fijadas.
+Los tests unitarios cubren las operaciones de ficheros, el deshacer, los formatos de portapapeles, la edición de texto UTF-8, i18n, la detección de discos y la persistencia de carpetas fijadas. Las escrituras en S3 se prueban contra un S3 falso en memoria (`src/s3/fake.rs`).
+
+### S3 contra el emulador oficial de AWS
+
+Hay un test de integración contra el [emulador oficial de AWS](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html) (`aws-emulator`). No corre por defecto. Comprueba de punta a punta:
+
+- TLS con la CA del emulador y path-style;
+- claves propias y credenciales del sistema;
+- subida multiparte de 20 MiB y que nunca se sobrescribe (`If-None-Match`);
+- copiar, mover, renombrar, deshacer y descargar carpetas;
+- borrados condicionales (`If-Match`).
+
+```sh
+# Instalar (Debian/Ubuntu; hay RPM y arm64 en la guía) y arrancar sin telemetría
+curl -fsSLo aws-emulator.deb https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+sudo apt-get install -y ./aws-emulator.deb
+EMULATOR_TELEMETRY=off aws-emulator &
+
+cargo test -- --ignored emulador
+```
+
+Lee el endpoint, las claves y la CA de `~/.aws/emulator/9297/` (otro directorio con `FEX_S3_EMULATOR_DIR`). Para usar el emulador desde fex, crea una conexión con esos mismos datos: host `https://127.0.0.1:9297`, región `us-east-1`, las claves de `emulator_credentials`, path-style activado y el certificado `ca.pem`.
 
 ## Límites del POC
 

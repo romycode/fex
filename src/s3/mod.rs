@@ -215,20 +215,17 @@ fn use_endpoint_for_tests(endpoint: &str) {
             .build(),
     );
     let config = aws_config::SdkConfig::builder().region(region.clone()).build();
-    let service = S3 {
-        runtime: tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap(),
-        connections: Mutex::new(HashMap::from([(
-            TEST_CONNECTION.to_owned(),
-            ConnectionClients {
-                config: Some(config),
-                path_style: true,
-                fixed_region: true,
-                regions: HashMap::new(),
-                clients: HashMap::from([(region, client)]),
-            },
-        )])),
-    };
-    assert!(SERVICE.set(service).is_ok(), "el S3 de tests solo se instala una vez");
+    // Se añade al servicio del proceso (que otros tests pueden haber creado ya).
+    service().unwrap().connections.lock().unwrap().insert(
+        TEST_CONNECTION.to_owned(),
+        ConnectionClients {
+            config: Some(config),
+            path_style: true,
+            fixed_region: true,
+            regions: HashMap::new(),
+            clients: HashMap::from([(region, client)]),
+        },
+    );
 }
 
 impl S3 {
@@ -357,11 +354,14 @@ fn sdk_error<E: ProvideErrorMetadata + std::error::Error + 'static, R>(
     io::Error::other(message.map_or_else(|| error.to_string(), str::to_owned))
 }
 
+/// Con `encoding-type=url`, S3 codifica como un formulario: el espacio es `+` y un `+`
+/// literal es `%2B`. Por eso `+` se traduce a espacio antes de decodificar los `%XX`.
 fn decode_key(value: &str, encoded: bool) -> io::Result<String> {
     if !encoded {
         return Ok(value.to_owned());
     }
-    percent_decode_str(value).decode_utf8().map(|s| s.into_owned()).map_err(io::Error::other)
+    let value = value.replace('+', " ");
+    percent_decode_str(&value).decode_utf8().map(|s| s.into_owned()).map_err(io::Error::other)
 }
 
 pub async fn list(location: Location) -> io::Result<Vec<Entry>> {
@@ -390,6 +390,7 @@ mod tests {
     #[test]
     fn url_decoding_preserves_literal_plus_and_percent() {
         assert_eq!(decode_key("folder%2Fa%2Bb%252F", true).unwrap(), "folder/a+b%2F");
+        assert_eq!(decode_key("a+%282%29.txt", true).unwrap(), "a (2).txt", "S3 codifica el espacio como +");
         assert_eq!(decode_key("a%2Bb+", false).unwrap(), "a%2Bb+");
     }
 
