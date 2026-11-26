@@ -26,6 +26,8 @@ use crate::{
     theme::{Theme, alpha},
 };
 
+pub const WINDOW_RADIUS: f32 = 12.;
+pub const WINDOW_CONTENT_INSET: f32 = 4.;
 pub const ROW_H: f32 = 30.;
 pub const FILE_TILE_W: f32 = 20.;
 pub const SIDEBAR_W: f32 = 184.;
@@ -114,6 +116,9 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let fullscreen = window.is_fullscreen() || window.is_simple_fullscreen();
+        let framed = !fullscreen && !(cfg!(target_os = "linux") && window.is_maximized());
+        self.framed = framed;
         let t = self.mode.resolve(window.appearance());
 
         // Envoltorio para el clic derecho en zona vacía (las filas paran la propagación).
@@ -173,6 +178,16 @@ impl Render for Explorer {
             .size_full()
             .flex()
             .bg(t.frame)
+            .when(framed, |d| {
+                // GPUI clips overflow to a rectangle. Inset the children so their
+                // corners stay inside the rounded border.
+                d.rounded(px(WINDOW_RADIUS))
+                    .border_1()
+                    .border_color(t.window_border)
+                    .p(px(WINDOW_CONTENT_INSET))
+                    .overflow_hidden()
+            })
+            .when(cfg!(target_os = "macos") && !fullscreen, |d| d.pt(px(32.)))
             .text_color(t.text)
             .text_sm()
             .child(self.render_sidebar(&t, cx))

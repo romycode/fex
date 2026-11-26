@@ -130,6 +130,8 @@ pub struct Explorer {
     // ------------------------------------------------------------ interacción
     pub selection: Selection,
     pub modal: Modal,
+    /// Ventana con bordes redondeados (no maximizada ni a pantalla completa). Lo fija `render`.
+    pub framed: bool,
     pub menu: Option<Menu>,
     pub clip: Option<Clip>,
     /// Carpeta recién creada que debe entrar en modo renombrar al aparecer en el listado.
@@ -225,6 +227,7 @@ impl Explorer {
             status_count: None,
             selection: Selection::default(),
             modal: Modal::None,
+            framed: false,
             menu: None,
             clip: None,
             pending_rename: None,

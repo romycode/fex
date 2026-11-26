@@ -132,7 +132,7 @@ impl Explorer {
         });
 
         let title = if form.original.is_some() { s.s3_edit } else { s.s3_add };
-        scrim("s3-scrim", t, cx).child(
+        scrim("s3-scrim", self.framed, t, cx).child(
             dialog("s3-form", t)
                 .w(px(560.))
                 .max_w(relative(0.95))

@@ -6,7 +6,7 @@ use gpui::{
     px, relative, white,
 };
 
-use super::Explorer;
+use super::{Explorer, WINDOW_RADIUS};
 use crate::{
     app::{Menu, Modal, commands},
     backend::Item,
@@ -15,11 +15,12 @@ use crate::{
 };
 
 /// Fondo oscurecido a pantalla completa. Un clic fuera del contenido cierra el modal.
-pub(super) fn scrim(id: &'static str, t: &Theme, cx: &Context<Explorer>) -> Stateful<Div> {
+pub(super) fn scrim(id: &'static str, framed: bool, t: &Theme, cx: &Context<Explorer>) -> Stateful<Div> {
     div()
         .id(id)
         .absolute()
         .inset_0()
+        .when(framed, |d| d.inset(px(1.)).rounded(px(WINDOW_RADIUS - 1.)))
         .occlude()
         .bg(t.scrim)
         .flex()
@@ -130,7 +131,7 @@ impl Explorer {
             .join(", ")
             + if paths.len() > 3 { ", …" } else { "" };
 
-        scrim("scrim", t, cx).child(
+        scrim("scrim", self.framed, t, cx).child(
             dialog("confirm", t)
                 .w(px(400.))
                 .p_5()
@@ -168,7 +169,7 @@ impl Explorer {
 
     pub(super) fn render_errors(&self, errors: &[String], t: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let s = self.lang.t();
-        scrim("errors-scrim", t, cx).child(
+        scrim("errors-scrim", self.framed, t, cx).child(
             dialog("errors", t)
                 .w(px(560.))
                 .max_w(relative(0.9))
@@ -265,7 +266,7 @@ impl Explorer {
         });
 
         // Arriba y centrada, como en los editores.
-        scrim("palette-scrim", t, cx).items_start().pt(px(72.)).child(
+        scrim("palette-scrim", self.framed, t, cx).items_start().pt(px(72.)).child(
             dialog("palette", t)
                 .w(px(520.))
                 .max_w(relative(0.9))

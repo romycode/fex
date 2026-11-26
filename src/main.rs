@@ -38,7 +38,7 @@ use std::{
     time::Instant,
 };
 
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 
 use app::Explorer;
@@ -114,11 +114,24 @@ fn main() {
     application().with_assets(Assets).run(move |cx: &mut App| {
         eprintln!("[fex] app lista: {:.1} ms", since_start_ms());
         let bounds = Bounds::centered(None, size(px(1000.), px(640.)), cx);
+        let options = WindowOptions {
+            window_background: WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        };
+        #[cfg(target_os = "macos")]
+        let options = {
+            let mut options = options;
+            if let Some(titlebar) = &mut options.titlebar {
+                // Let the frame reach the top edge while keeping the native controls.
+                titlebar.appears_transparent = true;
+            }
+            options
+        };
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("fex".into()),
-                ..Default::default()
+                ..options
             },
             move |window, cx| {
                 eprintln!("[fex] ventana creada: {:.1} ms", since_start_ms());
