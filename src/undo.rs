@@ -43,6 +43,11 @@ pub enum Undo {
     Trash {
         paths: Vec<Trashed>,
     },
+    /// Escritura en S3. Lleva los ETags: solo se toca lo que no haya cambiado.
+    S3 {
+        kind: UndoKind,
+        change: crate::s3::Change,
+    },
 }
 
 impl Undo {
@@ -54,6 +59,7 @@ impl Undo {
             Undo::Rename { .. } => UndoKind::Rename,
             Undo::NewFolder { .. } => UndoKind::NewFolder,
             Undo::Trash { .. } => UndoKind::Trash,
+            Undo::S3 { kind, .. } => *kind,
         }
     }
 
@@ -63,7 +69,7 @@ impl Undo {
             Undo::Move { pairs } => pairs.iter().map(|(_, path)| path.clone()).collect(),
             Undo::Rename { dir, to, .. } => vec![dir.join(to)],
             Undo::NewFolder { path } => vec![path.clone()],
-            Undo::Trash { .. } | Undo::Guarded { .. } => return Ok(self),
+            Undo::Trash { .. } | Undo::Guarded { .. } | Undo::S3 { .. } => return Ok(self),
         };
         let snapshots =
             paths.iter().map(|path| crate::safe_fs::Snapshot::capture(path)).collect::<io::Result<Vec<_>>>()?;
@@ -140,6 +146,7 @@ impl Undo {
                 Err(e) => r.errors.push(OpError::Io(file_name(&path), e)),
             },
             Undo::Trash { paths } => restore_from_trash(&paths, &mut r),
+            Undo::S3 { change, .. } => r = futures::executor::block_on(crate::s3::revert(change)),
         }
         r
     }

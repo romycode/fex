@@ -11,10 +11,17 @@ ui-tests = ["gpui/test-support", "gpui_platform/test-support"]
 [dependencies]
 # GPUI de Zed main (renderer wgpu en Linux). Fijado a un commit concreto: la API cambia a menudo.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b" }
+aws-config = "1"
+# Cliente HTTP del SDK: certificados CA propios por conexión (emuladores, servidores privados).
+aws-smithy-http-client = { version = "1.5", default-features = false, features = ["rustls-aws-lc"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
 futures = "0.3"
 notify = "8"
 libc = "0.2"
+once_cell = "1"
+percent-encoding = "2"
 tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread"] }
 xattr = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]

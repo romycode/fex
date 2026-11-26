@@ -49,6 +49,7 @@ icons! {
     System => "system",
     Pin => "pin",
     Close => "close",
+    Plus => "plus",
     ArrowUp => "arrow-up",
     ChevronRight => "chevron-right",
     Eye => "eye",
